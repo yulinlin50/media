@@ -1,19 +1,3 @@
-/*
- * Copyright 2021 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package androidx.media3.exoplayer.rtsp;
 
 import static androidx.media3.common.util.Util.usToMs;
@@ -57,6 +41,7 @@ import java.io.IOException;
 import java.net.BindException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Executor;
 import javax.net.SocketFactory;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
@@ -120,6 +105,36 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       String userAgent,
       SocketFactory socketFactory,
       boolean debugLoggingEnabled) {
+    this(
+        allocator,
+        rtpDataChannelFactory,
+        uri,
+        listener,
+        userAgent,
+        socketFactory,
+        debugLoggingEnabled,
+        /* credentials= */ null,
+        /* protocolEventExecutor= */ null,
+        /* protocolEventListener= */ null,
+        /* requestGeneration= */ 0,
+        /* attemptToken= */ 0,
+        /* controlRequestTimeoutMs= */ 0);
+  }
+
+  RtspMediaPeriod(
+      Allocator allocator,
+      RtpDataChannel.Factory rtpDataChannelFactory,
+      Uri uri,
+      Listener listener,
+      String userAgent,
+      SocketFactory socketFactory,
+      boolean debugLoggingEnabled,
+      @Nullable RtspMessageUtil.RtspAuthUserInfo credentials,
+      @Nullable Executor protocolEventExecutor,
+      @Nullable RtspProtocolEventListener protocolEventListener,
+      long requestGeneration,
+      long attemptToken,
+      long controlRequestTimeoutMs) {
     this.allocator = allocator;
     this.rtpDataChannelFactory = rtpDataChannelFactory;
     this.listener = listener;
@@ -133,7 +148,13 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
             /* userAgent= */ userAgent,
             /* uri= */ uri,
             socketFactory,
-            debugLoggingEnabled);
+            debugLoggingEnabled,
+            credentials,
+            protocolEventExecutor,
+            protocolEventListener,
+            requestGeneration,
+            attemptToken,
+            controlRequestTimeoutMs);
     rtspLoaderWrappers = new ArrayList<>();
     selectedLoadInfos = new ArrayList<>();
 
@@ -147,7 +168,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     for (int i = 0; i < rtspLoaderWrappers.size(); i++) {
       rtspLoaderWrappers.get(i).release();
     }
-    Util.closeQuietly(rtspClient);
+    rtspClient.release();
     released = true;
   }
 
@@ -158,7 +179,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     try {
       rtspClient.start();
     } catch (IOException e) {
-      preparationError = e;
+      preparationError = new RtspPlaybackException("RTSP connection failed", e);
       Util.closeQuietly(rtspClient);
     }
   }
@@ -581,10 +602,10 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       }
 
       if (!prepared) {
-        preparationError = error;
+        preparationError = new RtspPlaybackException("RTP data load failed", error);
       } else if (!isBindException) {
         playbackException =
-            new RtspPlaybackException(/* message= */ loadable.rtspMediaTrack.uri.toString(), error);
+            new RtspPlaybackException(/* message= */ "RTP data load failed", error);
       }
       return Loader.DONT_RETRY;
     }
@@ -693,7 +714,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
     @Override
     public void onSessionTimelineRequestFailed(String message, @Nullable Throwable cause) {
-      preparationError = cause == null ? new IOException(message) : new IOException(message, cause);
+      preparationError = new RtspPlaybackException(message, cause);
     }
   }
 

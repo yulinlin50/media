@@ -40,9 +40,9 @@ import androidx.media3.exoplayer.source.MediaSourceFactory;
 import androidx.media3.exoplayer.source.SinglePeriodTimeline;
 import androidx.media3.exoplayer.upstream.Allocator;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy;
-import com.google.common.base.Ascii;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.io.IOException;
+import java.util.concurrent.Executor;
 import javax.net.SocketFactory;
 
 /** An Rtsp {@link MediaSource} */
@@ -55,6 +55,9 @@ public final class RtspMediaSource extends BaseMediaSource {
 
   /** The default value for {@link Factory#setTimeoutMs}. */
   public static final long DEFAULT_TIMEOUT_MS = 8000;
+
+  /** The default timeout for RTSP control requests. */
+  public static final long DEFAULT_CONTROL_REQUEST_TIMEOUT_MS = 10_000;
 
   /**
    * Factory for {@link RtspMediaSource}
@@ -74,11 +77,21 @@ public final class RtspMediaSource extends BaseMediaSource {
     private SocketFactory socketFactory;
     private boolean forceUseRtpTcp;
     private boolean debugLoggingEnabled;
+    private long controlRequestTimeoutMs;
+    @Nullable private String credentialUsername;
+    @Nullable private String credentialPassword;
+    @Nullable private Executor protocolEventExecutor;
+    @Nullable private RtspProtocolEventListener protocolEventListener;
+    private long requestGeneration;
+    private long attemptToken;
 
     public Factory() {
       timeoutMs = DEFAULT_TIMEOUT_MS;
       userAgent = MediaLibraryInfo.VERSION_SLASHY;
       socketFactory = SocketFactory.getDefault();
+      controlRequestTimeoutMs = DEFAULT_CONTROL_REQUEST_TIMEOUT_MS;
+      requestGeneration = 0;
+      attemptToken = 0;
     }
 
     /**
@@ -107,6 +120,19 @@ public final class RtspMediaSource extends BaseMediaSource {
     @CanIgnoreReturnValue
     public Factory setUserAgent(String userAgent) {
       this.userAgent = userAgent;
+      return this;
+    }
+
+    /**
+     * Sets source credentials used for RTSP Basic or Digest authentication.
+     *
+     * <p>The credentials are kept inside the RTSP client and are never copied into the
+     * {@link MediaItem}.
+     */
+    @CanIgnoreReturnValue
+    public Factory setCredentials(String username, String password) {
+      this.credentialUsername = checkNotNull(username);
+      this.credentialPassword = checkNotNull(password);
       return this;
     }
 
@@ -154,6 +180,34 @@ public final class RtspMediaSource extends BaseMediaSource {
       return this;
     }
 
+    /**
+     * Sets the timeout for RTSP control requests such as OPTIONS, DESCRIBE, SETUP, PLAY and
+     * keep-alive requests. A value of zero disables the additional control-request watchdog.
+     */
+    @CanIgnoreReturnValue
+    public Factory setControlRequestTimeoutMs(@IntRange(from = 0) long controlRequestTimeoutMs) {
+      checkArgument(controlRequestTimeoutMs >= 0);
+      this.controlRequestTimeoutMs = controlRequestTimeoutMs;
+      return this;
+    }
+
+    /**
+     * Delivers redacted protocol events on {@code executor}. Events contain no URI, header or
+     * credential data.
+     */
+    @CanIgnoreReturnValue
+    public Factory setProtocolEventListener(
+        Executor executor,
+        RtspProtocolEventListener listener,
+        long requestGeneration,
+        long attemptToken) {
+      this.protocolEventExecutor = checkNotNull(executor);
+      this.protocolEventListener = checkNotNull(listener);
+      this.requestGeneration = requestGeneration;
+      this.attemptToken = attemptToken;
+      return this;
+    }
+
     /** Does nothing. {@link RtspMediaSource} does not support DRM. */
     @Override
     public Factory setDrmSessionManagerProvider(DrmSessionManagerProvider drmSessionManager) {
@@ -181,37 +235,46 @@ public final class RtspMediaSource extends BaseMediaSource {
     @Override
     public RtspMediaSource createMediaSource(MediaItem mediaItem) {
       checkNotNull(mediaItem.localConfiguration);
+      MediaItem sanitizedMediaItem = sanitizeMediaItem(mediaItem);
+      @Nullable RtspMessageUtil.RtspAuthUserInfo credentials =
+          credentialUsername != null && credentialPassword != null
+              ? new RtspMessageUtil.RtspAuthUserInfo(credentialUsername, credentialPassword)
+              : null;
       return new RtspMediaSource(
-          mediaItem,
+          sanitizedMediaItem,
           shouldForceUseRtpTcp(mediaItem)
               ? new TransferRtpDataChannelFactory(timeoutMs)
               : new UdpDataSourceRtpDataChannelFactory(timeoutMs),
           userAgent,
           socketFactory,
-          debugLoggingEnabled);
+          debugLoggingEnabled,
+          credentials,
+          protocolEventExecutor,
+          protocolEventListener,
+          requestGeneration,
+          attemptToken,
+          controlRequestTimeoutMs);
     }
 
     private boolean shouldForceUseRtpTcp(MediaItem mediaItem) {
-      if (forceUseRtpTcp) {
-        return true;
-      }
-      @Nullable String scheme = checkNotNull(mediaItem.localConfiguration).uri.getScheme();
-      return scheme != null && Ascii.equalsIgnoreCase("rtspt", scheme);
+      return forceUseRtpTcp;
     }
   }
 
   /** Thrown when an exception or error is encountered during loading an RTSP stream. */
   public static class RtspPlaybackException extends IOException {
     public RtspPlaybackException(String message) {
-      super(message);
+      super(RtspMessageUtil.redactErrorMessage(message));
     }
 
+    /** Creates a redacted exception without retaining the original cause chain. */
     public RtspPlaybackException(Throwable e) {
-      super(e);
+      super(RtspMessageUtil.redactErrorMessage(null));
     }
 
+    /** Creates a redacted exception without retaining the original cause chain. */
     public RtspPlaybackException(String message, Throwable e) {
-      super(message, e);
+      super(RtspMessageUtil.redactErrorMessage(message));
     }
   }
 
@@ -227,6 +290,12 @@ public final class RtspMediaSource extends BaseMediaSource {
   private final Uri uri;
   private final SocketFactory socketFactory;
   private final boolean debugLoggingEnabled;
+  @Nullable private final RtspMessageUtil.RtspAuthUserInfo credentials;
+  @Nullable private final Executor protocolEventExecutor;
+  @Nullable private final RtspProtocolEventListener protocolEventListener;
+  private final long requestGeneration;
+  private final long attemptToken;
+  private final long controlRequestTimeoutMs;
 
   private long timelineDurationUs;
   private boolean timelineIsSeekable;
@@ -243,12 +312,45 @@ public final class RtspMediaSource extends BaseMediaSource {
       String userAgent,
       SocketFactory socketFactory,
       boolean debugLoggingEnabled) {
-    this.mediaItem = mediaItem;
+    this(
+        mediaItem,
+        rtpDataChannelFactory,
+        userAgent,
+        socketFactory,
+        debugLoggingEnabled,
+        /* credentials= */ null,
+        /* protocolEventExecutor= */ null,
+        /* protocolEventListener= */ null,
+        /* requestGeneration= */ 0,
+        /* attemptToken= */ 0,
+        /* controlRequestTimeoutMs= */ DEFAULT_CONTROL_REQUEST_TIMEOUT_MS);
+  }
+
+  private RtspMediaSource(
+      MediaItem mediaItem,
+      RtpDataChannel.Factory rtpDataChannelFactory,
+      String userAgent,
+      SocketFactory socketFactory,
+      boolean debugLoggingEnabled,
+      @Nullable RtspMessageUtil.RtspAuthUserInfo credentials,
+      @Nullable Executor protocolEventExecutor,
+      @Nullable RtspProtocolEventListener protocolEventListener,
+      long requestGeneration,
+      long attemptToken,
+      long controlRequestTimeoutMs) {
+    this.mediaItem = sanitizeMediaItem(mediaItem);
     this.rtpDataChannelFactory = rtpDataChannelFactory;
     this.userAgent = userAgent;
-    this.uri = maybeConvertRtsptUriScheme(checkNotNull(mediaItem.localConfiguration).uri);
+    this.uri = RtspMessageUtil.sanitizeRtspUri(checkNotNull(this.mediaItem.localConfiguration).uri);
     this.socketFactory = socketFactory;
     this.debugLoggingEnabled = debugLoggingEnabled;
+    this.credentials = credentials;
+    this.protocolEventExecutor = protocolEventExecutor;
+    this.protocolEventListener = protocolEventListener;
+    this.requestGeneration = requestGeneration;
+    this.attemptToken = attemptToken;
+    this.controlRequestTimeoutMs =
+        controlRequestTimeoutMs > 0 ? controlRequestTimeoutMs : DEFAULT_CONTROL_REQUEST_TIMEOUT_MS;
     this.timelineDurationUs = C.TIME_UNSET;
     this.timelineIsPlaceholder = true;
   }
@@ -272,12 +374,12 @@ public final class RtspMediaSource extends BaseMediaSource {
   public boolean canUpdateMediaItem(MediaItem mediaItem) {
     @Nullable MediaItem.LocalConfiguration newConfiguration = mediaItem.localConfiguration;
     return newConfiguration != null
-        && maybeConvertRtsptUriScheme(newConfiguration.uri).equals(this.uri);
+        && isSameRtspUri(newConfiguration.uri);
   }
 
   @Override
   public synchronized void updateMediaItem(MediaItem mediaItem) {
-    this.mediaItem = mediaItem;
+    this.mediaItem = sanitizeMediaItem(mediaItem);
   }
 
   @Override
@@ -309,7 +411,13 @@ public final class RtspMediaSource extends BaseMediaSource {
         },
         userAgent,
         socketFactory,
-        debugLoggingEnabled);
+        debugLoggingEnabled,
+        credentials,
+        protocolEventExecutor,
+        protocolEventListener,
+        requestGeneration,
+        attemptToken,
+        controlRequestTimeoutMs);
   }
 
   @Override
@@ -319,12 +427,29 @@ public final class RtspMediaSource extends BaseMediaSource {
 
   // Internal methods.
 
-  private static Uri maybeConvertRtsptUriScheme(Uri uri) {
-    @Nullable String scheme = uri.getScheme();
-    if (scheme == null || !Ascii.equalsIgnoreCase("rtspt", scheme)) {
-      return uri;
+  private static MediaItem sanitizeMediaItem(MediaItem mediaItem) {
+    if (mediaItem.localConfiguration == null) {
+      return mediaItem;
     }
-    return Uri.parse("rtsp" + uri.toString().substring(5));
+    RtspMessageUtil.checkIsRtspUri(mediaItem.localConfiguration.uri);
+    return mediaItem.buildUpon()
+        .setUri(RtspMessageUtil.sanitizeRtspUri(mediaItem.localConfiguration.uri))
+        .setRequestMetadata(
+            mediaItem.requestMetadata.buildUpon()
+                .setMediaUri(
+                    mediaItem.requestMetadata.mediaUri == null
+                        ? null
+                        : RtspMessageUtil.removeUserInfo(mediaItem.requestMetadata.mediaUri))
+                .build())
+        .build();
+  }
+
+  private boolean isSameRtspUri(Uri uri) {
+    try {
+      return RtspMessageUtil.sanitizeRtspUri(uri).equals(this.uri);
+    } catch (IllegalArgumentException e) {
+      return false;
+    }
   }
 
   private void notifySourceInfoRefreshed() {
