@@ -19,6 +19,17 @@ android {
   sourceSets { getByName("androidTest").assets.directories.add("../test_data/src/test/assets") }
 }
 
+// FFmpeg static libs (jni/ffmpeg/android-libs) are only produced for the two
+// ABIs the app ships (scripts/build-ffmpeg-ubuntu.sh in the app repo);
+// restrict the native build so ninja doesn't demand the missing ones.
+// (AGP 9 removed the module-level ndk {} block; ABI selection lives on the
+// variant API's externalNativeBuild.)
+androidComponents {
+  onVariants { variant ->
+    variant.externalNativeBuild?.abiFilters?.set(setOf("armeabi-v7a", "arm64-v8a"))
+  }
+}
+
 // Configure the native build only if ffmpeg is present to avoid gradle sync
 // failures if ffmpeg hasn't been built according to the README instructions.
 if (project.file("src/main/jni/ffmpeg").exists()) {
