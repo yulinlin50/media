@@ -27,6 +27,14 @@ if (project.file("src/main/jni/ffmpeg").exists()) {
   // Should match cmake_minimum_required.
   android.externalNativeBuild.cmake.version = "3.21.0+"
   // LINT.ThenChange(src/main/jni/CMakeLists.txt)
+} else {
+  // Not just a sync-failure guard: without jni/ffmpeg the AAR ships no
+  // libffmpegJNI.so and FFmpeg software decoding silently disappears from
+  // builds that would otherwise succeed. Make that state loud.
+  logger.warn(
+      "[decoder_ffmpeg] src/main/jni/ffmpeg is MISSING — libffmpegJNI.so will NOT be built and "
+          + "FFmpeg software audio decoding (AC-3/E-AC-3/DTS/MP2/...) will silently be unavailable"
+          + " at runtime. Build FFmpeg first (see libraries/decoder_ffmpeg/README.md).")
 }
 
 dependencies {
