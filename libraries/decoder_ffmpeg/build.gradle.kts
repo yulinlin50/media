@@ -45,7 +45,7 @@ if (project.file("src/main/jni/ffmpeg").exists()) {
   logger.warn(
       "[decoder_ffmpeg] src/main/jni/ffmpeg is MISSING — libffmpegJNI.so will NOT be built and "
           + "FFmpeg software audio decoding (AC-3/E-AC-3/DTS/MP2/...) will silently be unavailable"
-          + " at runtime. Build FFmpeg first (see libraries/decoder_ffmpeg/README.md).")
+          + " at runtime. Build FFmpeg first (scripts/build-ffmpeg-ubuntu.sh in the app repo).")
 }
 
 dependencies {

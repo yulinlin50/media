@@ -121,9 +121,10 @@ public final class FfmpegLibrary {
         return "aac";
       case MimeTypes.AUDIO_MPEG:
         return "mp3";
-      // MPEG-1 Layers 1/2 are separate FFmpeg decoders; asking the "mp3"
-      // decoder for them fails. ffmpeg_jni.cc looks decoders up by this name,
-      // so "mp2" must also be in the --enable-decoder build list.
+      // ffmpeg_jni.cc looks decoders up by their registered FFmpeg name, and
+      // "mp2" and "mp3" are two distinct decoders; map MPEG-1 Layers 1/2 to
+      // "mp2" so the lookup matches exactly. "mp2" must also be in the
+      // --enable-decoder build list (scripts/build-ffmpeg-ubuntu.sh has it).
       case MimeTypes.AUDIO_MPEG_L1:
       case MimeTypes.AUDIO_MPEG_L2:
         return "mp2";
