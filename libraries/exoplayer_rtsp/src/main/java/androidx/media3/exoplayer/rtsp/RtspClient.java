@@ -321,7 +321,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       // the RTSP server stops sending RTP packets and frees up resources.
       keepAliveMonitor.close();
       keepAliveMonitor = null;
-      if (!released && sessionId != null) {
+      if (sessionId != null) {
         messageSender.sendTeardownRequest(uri, sessionId);
       }
     }
@@ -347,7 +347,6 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       sessionId = null;
       receivedAuthorizationRequest = false;
       rtspAuthenticationInfo = null;
-      messageSender.sendOptionsRequest(uri, sessionId);
     } catch (IOException e) {
       playbackEventListener.onPlaybackError(new RtspPlaybackException(e));
     }
@@ -477,7 +476,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
           getRequestWithCommonHeaders(
               METHOD_SETUP,
               sessionId,
-              /* addit…245 tokens truncated…D_TEARDOWN, sessionId, /* additionalHeaders= */ ImmutableMap.of(), uri));
+              /* additionalHeaders= */ ImmutableMap.of(RtspHeaders.TRANSPORT, transport),
+              trackUri));
     }
 
     public void sendPauseRequest(Uri uri, String sessionId) {
@@ -490,20 +490,24 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
     public void sendPlayRequest(Uri uri, long offsetMs, @Nullable String sessionId) {
       checkState(rtspState == RTSP_STATE_READY || rtspState == RTSP_STATE_PLAYING);
-      // 定制:回放定位。offsetMs 非 0 时带 Range: npt=<秒>,从指定偏移起播。
-      // 本方法为功能重建版(原始实现随工作区丢失),依据调用点 sendPlayRequest(uri, offsetMs, sessionId) 反推。
-      ImmutableMap.Builder<String, String> additionalHeaders = ImmutableMap.builder();
-      if (offsetMs != 0L) {
-        additionalHeaders.put(
-            RtspHeaders.RANGE, Util.formatInvariant("npt=%.3f", offsetMs / 1000f));
-      }
-      rtspState = RTSP_STATE_PLAYING;
       sendRequest(
           getRequestWithCommonHeaders(
-              METHOD_PLAY, sessionId, /* additionalHeaders= */ additionalHeaders.buildOrThrow(), uri));
+              METHOD_PLAY,
+              sessionId,
+              /* additionalHeaders= */ ImmutableMap.of(
+                  RtspHeaders.RANGE, RtspSessionTiming.getOffsetStartTimeTiming(offsetMs)),
+              uri));
     }
 
     public void sendTeardownRequest(Uri uri, @Nullable String sessionId) {
+      if (sessionId == null
+          || rtspState == RTSP_STATE_UNINITIALIZED
+          || rtspState == RTSP_STATE_INIT) {
+        // No need to perform session teardown before a session is set up, where the state is
+        // RTSP_STATE_READY or RTSP_STATE_PLAYING.
+        return;
+      }
+      rtspState = RTSP_STATE_INIT;
       sendRequest(
           getRequestWithCommonHeaders(
               METHOD_TEARDOWN, sessionId, /* additionalHeaders= */ ImmutableMap.of(), uri));
