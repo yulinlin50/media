@@ -15,6 +15,10 @@
  */
 package androidx.media3.exoplayer.rtsp;
 
+import static androidx.media3.exoplayer.rtsp.RtspRequest.METHOD_DESCRIBE;
+import static androidx.media3.exoplayer.rtsp.RtspRequest.METHOD_PLAY;
+import static androidx.media3.exoplayer.rtsp.RtspRequest.METHOD_SETUP;
+import static androidx.media3.exoplayer.rtsp.RtspRequest.METHOD_TEARDOWN;
 import static androidx.media3.test.utils.robolectric.TestPlayerRunHelper.advance;
 import static androidx.media3.test.utils.robolectric.TestPlayerRunHelper.play;
 import static com.google.common.base.Preconditions.checkNotNull;
@@ -127,6 +131,64 @@ public final class RtspPlaybackTest {
   }
 
   @Test
+  public void prepare_setupAndPlayRequests_useUpstreamWireFormat() throws Exception {
+    FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
+    RtpDataChannel.Factory rtpDataChannelFactory = (trackId) -> fakeRtpDataChannel;
+    ResponseProvider responseProvider =
+        new ResponseProvider(
+            clock,
+            ImmutableList.of(aacRtpPacketStreamDump, mpeg2tsRtpPacketStreamDump),
+            fakeRtpDataChannel,
+            RtspMessageUtil.DEFAULT_RTSP_TIMEOUT_MS,
+            /* optionsRequestCounter= */ Optional.empty());
+    rtspServer = new RtspServer(responseProvider);
+    ExoPlayer player = createExoPlayer(rtspServer.startAndGetPortNumber(), rtpDataChannelFactory);
+
+    player.prepare();
+    player.play();
+    TestPlayerRunHelper.runUntilPlaybackState(player, Player.STATE_READY);
+    player.release();
+
+    // Regression (review RTSP-001): every SETUP must carry the Transport header.
+    List<RtspRequest> setupRequests = requestsOfMethod(METHOD_SETUP);
+    assertThat(setupRequests).isNotEmpty();
+    for (RtspRequest request : setupRequests) {
+      assertThat(request.headers.get(RtspHeaders.TRANSPORT)).isNotNull();
+    }
+    // Regression (review SES-3/RTSP-006): PLAY always carries a well-formed open-ended NPT
+    // range, including at offset zero.
+    List<RtspRequest> playRequests = requestsOfMethod(METHOD_PLAY);
+    assertThat(playRequests).isNotEmpty();
+    for (RtspRequest request : playRequests) {
+      assertThat(request.headers.get(RtspHeaders.RANGE)).isEqualTo("npt=0.000-");
+    }
+  }
+
+  @Test
+  public void release_afterPlaybackStarted_sendsTeardown() throws Exception {
+    FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
+    RtpDataChannel.Factory rtpDataChannelFactory = (trackId) -> fakeRtpDataChannel;
+    ResponseProvider responseProvider =
+        new ResponseProvider(
+            clock,
+            ImmutableList.of(aacRtpPacketStreamDump, mpeg2tsRtpPacketStreamDump),
+            fakeRtpDataChannel,
+            RtspMessageUtil.DEFAULT_RTSP_TIMEOUT_MS,
+            /* optionsRequestCounter= */ Optional.empty());
+    rtspServer = new RtspServer(responseProvider);
+    ExoPlayer player = createExoPlayer(rtspServer.startAndGetPortNumber(), rtpDataChannelFactory);
+
+    player.prepare();
+    player.play();
+    TestPlayerRunHelper.runUntilPlaybackState(player, Player.STATE_READY);
+    player.release();
+
+    // Regression (review RTSP-004/SES-2): release() must TEARDOWN the server session so the
+    // server stops pushing RTP packets and frees up the session.
+    RobolectricUtil.runMainLooperUntil(() -> !requestsOfMethod(METHOD_TEARDOWN).isEmpty());
+  }
+
+  @Test
   public void prepare_noSupportedTrack_throwsPreparationError() throws Exception {
     FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
     RtpDataChannel.Factory rtpDataChannelFactory = (trackId) -> fakeRtpDataChannel;
@@ -182,6 +244,12 @@ public final class RtspPlaybackTest {
     assertThat(responseProviderSupportingOnlyTcp.getDumpsForSetUpTracks())
         .containsExactly(aacRtpPacketStreamDump);
     DumpFileAsserts.assertOutput(applicationContext, playbackOutput, "playbackdumps/rtsp/aac.dump");
+    // Regression (review RTSP-002/SES-1): the TCP fallback must not restart the OPTIONS/DESCRIBE
+    // negotiation or re-run SETUP/PLAY — one DESCRIBE, one UDP SETUP (461) followed by one TCP
+    // SETUP, and one PLAY for the whole session.
+    assertThat(requestsOfMethod(METHOD_DESCRIBE)).hasSize(1);
+    assertThat(requestsOfMethod(METHOD_SETUP)).hasSize(2);
+    assertThat(requestsOfMethod(METHOD_PLAY)).hasSize(1);
   }
 
   @Test
@@ -303,6 +371,16 @@ public final class RtspPlaybackTest {
     player.release();
 
     verify(listener, never()).onIsLoadingChanged(true);
+  }
+
+  private List<RtspRequest> requestsOfMethod(int method) {
+    List<RtspRequest> requests = new ArrayList<>();
+    for (RtspRequest request : rtspServer.getReceivedRequests()) {
+      if (request.method == method) {
+        requests.add(request);
+      }
+    }
+    return requests;
   }
 
   private ExoPlayer createExoPlayer(

@@ -32,6 +32,7 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.util.ArrayList;
 import java.util.List;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
@@ -77,6 +78,9 @@ public final class RtspServer implements Closeable {
 
   private volatile boolean isCanceled;
 
+  /** The requests received so far, in arrival order. Only touch on the main looper thread. */
+  private final List<RtspRequest> receivedRequests = new ArrayList<>();
+
   /**
    * Creates a new instance.
    *
@@ -105,6 +109,11 @@ public final class RtspServer implements Closeable {
         new ServerSocket(/* port= */ 0, /* backlog= */ 1, InetAddress.getByName(/* host= */ null));
     listenerThread.start();
     return serverSocket.getLocalPort();
+  }
+
+  /** Returns the requests received so far, in arrival order. Only touch on the main looper. */
+  public List<RtspRequest> getReceivedRequests() {
+    return receivedRequests;
   }
 
   @Override
@@ -137,6 +146,7 @@ public final class RtspServer implements Closeable {
 
     private void handleRtspMessage(List<String> message) {
       RtspRequest request = RtspMessageUtil.parseRequest(message);
+      receivedRequests.add(request);
       String cSeq = checkNotNull(request.headers.get(RtspHeaders.CSEQ));
       switch (request.method) {
         case METHOD_OPTIONS:
