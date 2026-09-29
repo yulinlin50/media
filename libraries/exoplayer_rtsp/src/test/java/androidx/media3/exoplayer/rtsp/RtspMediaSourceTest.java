@@ -27,6 +27,7 @@ import androidx.media3.exoplayer.upstream.BandwidthMeter;
 import androidx.media3.test.utils.TestUtil;
 import androidx.media3.test.utils.robolectric.RobolectricUtil;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import java.lang.reflect.Field;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -107,6 +108,30 @@ public class RtspMediaSourceTest {
                 .localConfiguration
                 .uri)
         .isEqualTo(Uri.parse("rtsp://test.test"));
+  }
+
+  @Test
+  public void createMediaSource_withZeroControlRequestTimeoutMs_keepsZero() throws Exception {
+    MediaItem mediaItem = new MediaItem.Builder().setUri("rtsp://test.test").build();
+    // A value of zero disables the control-request watchdog (Factory contract).
+    RtspMediaSource zeroTimeoutSource =
+        new RtspMediaSource.Factory().setControlRequestTimeoutMs(0).createMediaSource(mediaItem);
+    RtspMediaSource unsetSource = new RtspMediaSource.Factory().createMediaSource(mediaItem);
+    RtspMediaSource explicitSource =
+        new RtspMediaSource.Factory()
+            .setControlRequestTimeoutMs(4_000)
+            .createMediaSource(mediaItem);
+
+    assertThat(getControlRequestTimeoutMs(zeroTimeoutSource)).isEqualTo(0L);
+    assertThat(getControlRequestTimeoutMs(unsetSource))
+        .isEqualTo(RtspMediaSource.DEFAULT_CONTROL_REQUEST_TIMEOUT_MS);
+    assertThat(getControlRequestTimeoutMs(explicitSource)).isEqualTo(4_000L);
+  }
+
+  private static long getControlRequestTimeoutMs(RtspMediaSource source) throws Exception {
+    Field field = RtspMediaSource.class.getDeclaredField("controlRequestTimeoutMs");
+    field.setAccessible(true);
+    return field.getLong(source);
   }
 
   private static MediaSource buildMediaSource(MediaItem mediaItem) {

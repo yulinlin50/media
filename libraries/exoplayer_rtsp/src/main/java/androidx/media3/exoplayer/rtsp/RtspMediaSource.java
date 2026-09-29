@@ -349,8 +349,7 @@ public final class RtspMediaSource extends BaseMediaSource {
     this.protocolEventListener = protocolEventListener;
     this.requestGeneration = requestGeneration;
     this.attemptToken = attemptToken;
-    this.controlRequestTimeoutMs =
-        controlRequestTimeoutMs > 0 ? controlRequestTimeoutMs : DEFAULT_CONTROL_REQUEST_TIMEOUT_MS;
+    this.controlRequestTimeoutMs = controlRequestTimeoutMs;
     this.timelineDurationUs = C.TIME_UNSET;
     this.timelineIsPlaceholder = true;
   }
