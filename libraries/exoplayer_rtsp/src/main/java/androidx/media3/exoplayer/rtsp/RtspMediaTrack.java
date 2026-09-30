@@ -169,12 +169,15 @@ import com.google.common.collect.ImmutableMap;
   */
  public RtspMediaTrack(
      RtspHeaders rtspHeaders, MediaDescription mediaDescription, Uri sessionUri) {
-   checkArgument(
-       mediaDescription.attributes.containsKey(ATTR_CONTROL), "missing attribute control");
+   // IPTV servers commonly omit the session-level a=control:* and per-media a=control lines;
+   // falling back to the generic control attribute keeps such SDPs playable (RFC2326
+   // Section C.3: a missing control attribute defaults to the session URL).
+   String controlAttribute =
+       mediaDescription.attributes.containsKey(ATTR_CONTROL)
+           ? castNonNull(mediaDescription.attributes.get(ATTR_CONTROL))
+           : GENERIC_CONTROL_ATTR;
    payloadFormat = generatePayloadFormat(mediaDescription);
-   uri =
-       extractTrackUri(
-           rtspHeaders, sessionUri, castNonNull(mediaDescription.attributes.get(ATTR_CONTROL)));
+   uri = extractTrackUri(rtspHeaders, sessionUri, controlAttribute);
  }
 
  @Override
@@ -266,6 +269,9 @@ import com.google.common.collect.ImmutableMap;
      case MimeTypes.VIDEO_MP4V:
        checkArgument(!fmtpParameters.isEmpty());
        processMPEG4FmtpAttribute(formatBuilder, fmtpParameters);
+       break;
+     case MimeTypes.VIDEO_MP2T:
+       // MPEG-2 TS carries its own program descriptions (PAT/PMT); no fmtp attribute to process.
        break;
      case MimeTypes.VIDEO_H263:
        // H263 never uses fmtp width and height attributes (RFC4629 Section 8.2), setting default

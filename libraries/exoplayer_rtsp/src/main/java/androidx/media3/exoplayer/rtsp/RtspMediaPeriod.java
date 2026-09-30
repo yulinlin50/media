@@ -9,10 +9,14 @@ import android.net.Uri;
 import android.os.Handler;
 import androidx.annotation.Nullable;
 import androidx.media3.common.C;
+import androidx.media3.common.DataReader;
 import androidx.media3.common.Format;
+import androidx.media3.common.MimeTypes;
 import androidx.media3.common.StreamKey;
 import androidx.media3.common.TrackGroup;
+import androidx.media3.common.util.Log;
 import androidx.media3.common.util.NullableType;
+import androidx.media3.common.util.ParsableByteArray;
 import androidx.media3.common.util.Util;
 import androidx.media3.decoder.DecoderInputBuffer;
 import androidx.media3.exoplayer.FormatHolder;
@@ -48,6 +52,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 /** A {@link MediaPeriod} that loads an RTSP stream. */
 /* package */ final class RtspMediaPeriod implements MediaPeriod {
 
+  private static final String TAG = "RtspMediaPeriod";
+
   /** Listener for information about the period. */
   interface Listener {
 
@@ -69,6 +75,16 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   private final List<RtpLoadInfo> selectedLoadInfos;
   private final Listener listener;
   private final RtpDataChannel.Factory rtpDataChannelFactory;
+  /**
+   * Guards {@link RtspLoaderWrapper#extraSampleQueues} and the flat index lists below. An MP2T RTP
+   * track fans out to one {@link SampleQueue} per elementary stream: the extra queues are created
+   * on the loading thread (while the TS extractor parses the PMT) and consumed on the playback
+   * thread, so every access goes through this lock.
+   */
+  private final Object extraQueuesLock;
+
+  @Nullable private ImmutableList<SampleQueue> flatSampleQueues;
+  @Nullable private ImmutableList<RtspLoaderWrapper> flatWrappers;
 
   private @MonotonicNonNull Callback callback;
   private @MonotonicNonNull ImmutableList<TrackGroup> trackGroups;
@@ -83,6 +99,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   private boolean released;
   private boolean prepared;
   private boolean trackSelected;
+  /** Guards against issuing SETUP twice for the same transport (MP2T pre-selection SETUP). */
+  private boolean setupRequested;
   private int portBindingRetryCount;
   private boolean isUsingRtpTcp;
 
@@ -157,6 +175,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
             controlRequestTimeoutMs);
     rtspLoaderWrappers = new ArrayList<>();
     selectedLoadInfos = new ArrayList<>();
+    extraQueuesLock = new Object();
 
     pendingSeekPositionUs = C.TIME_UNSET;
     requestedSeekPositionUs = C.TIME_UNSET;
@@ -227,8 +246,16 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       }
 
       TrackGroup trackGroup = selection.getTrackGroup();
+      // Track group indices address the flat space: with MP2T sources one RTP track fans out to
+      // multiple sample queues, so the index maps through the flat wrapper list.
       int trackGroupIndex = checkNotNull(trackGroups).indexOf(trackGroup);
-      selectedLoadInfos.add(checkNotNull(rtspLoaderWrappers.get(trackGroupIndex)).loadInfo);
+      if (trackGroupIndex == C.INDEX_UNSET) {
+        continue;
+      }
+      RtpLoadInfo loadInfo = checkNotNull(flatWrappers).get(trackGroupIndex).loadInfo;
+      if (!selectedLoadInfos.contains(loadInfo)) {
+        selectedLoadInfos.add(loadInfo);
+      }
 
       // Find the sampleStreamWrapper that contains this track group.
       if (trackGroups.contains(trackGroup)) {
@@ -269,6 +296,14 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       RtspLoaderWrapper loaderWrapper = rtspLoaderWrappers.get(i);
       if (!loaderWrapper.canceled) {
         loaderWrapper.sampleQueue.discardTo(positionUs, toKeyframe, /* stopAtReadPosition= */ true);
+        List<SampleQueue> extraSampleQueues = loaderWrapper.extraSampleQueues;
+        synchronized (extraQueuesLock) {
+          for (int j = 0; j < extraSampleQueues.size(); j++) {
+            extraSampleQueues
+                .get(j)
+                .discardTo(positionUs, toKeyframe, /* stopAtReadPosition= */ true);
+          }
+        }
       }
     }
   }
@@ -411,7 +446,20 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   // SampleStream methods.
 
   /* package */ boolean isReady(int trackGroupIndex) {
-    return !suppressRead() && rtspLoaderWrappers.get(trackGroupIndex).isSampleQueueReady();
+    if (suppressRead()) {
+      return false;
+    }
+    synchronized (extraQueuesLock) {
+      // During a UDP->TCP fallback the flat lists are rebuilt as the new MP2T queues register;
+      // until then a flat index may point past the current list.
+      if (flatSampleQueues == null || flatWrappers == null
+          || trackGroupIndex >= flatSampleQueues.size()) {
+        return false;
+      }
+      return flatSampleQueues
+          .get(trackGroupIndex)
+          .isReady(/* loadingFinished= */ flatWrappers.get(trackGroupIndex).canceled);
+    }
   }
 
   @ReadDataResult
@@ -423,14 +471,37 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     if (suppressRead()) {
       return C.RESULT_NOTHING_READ;
     }
-    return rtspLoaderWrappers.get(sampleQueueIndex).read(formatHolder, buffer, readFlags);
+    synchronized (extraQueuesLock) {
+      if (flatSampleQueues == null || flatWrappers == null
+          || sampleQueueIndex >= flatSampleQueues.size()) {
+        return C.RESULT_NOTHING_READ;
+      }
+      return flatSampleQueues
+          .get(sampleQueueIndex)
+          .read(
+              formatHolder,
+              buffer,
+              readFlags,
+              /* loadingFinished= */ flatWrappers.get(sampleQueueIndex).canceled);
+    }
   }
 
   /* package */ int skipData(int sampleQueueIndex, long positionUs) {
     if (suppressRead()) {
       return C.RESULT_NOTHING_READ;
     }
-    return rtspLoaderWrappers.get(sampleQueueIndex).skipData(positionUs);
+    synchronized (extraQueuesLock) {
+      if (flatSampleQueues == null || flatWrappers == null
+          || sampleQueueIndex >= flatSampleQueues.size()) {
+        return C.RESULT_NOTHING_READ;
+      }
+      SampleQueue sampleQueue = flatSampleQueues.get(sampleQueueIndex);
+      int skipCount =
+          sampleQueue.getSkipCount(
+              positionUs, /* allowEndOfQueue= */ flatWrappers.get(sampleQueueIndex).canceled);
+      sampleQueue.skip(skipCount);
+      return skipCount;
+    }
   }
 
   private boolean suppressRead() {
@@ -463,14 +534,54 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
     // Make sure all sample queues have got format assigned.
     for (int i = 0; i < rtspLoaderWrappers.size(); i++) {
-      if (rtspLoaderWrappers.get(i).sampleQueue.getUpstreamFormat() == null) {
+      RtspLoaderWrapper loaderWrapper = rtspLoaderWrappers.get(i);
+      if (loaderWrapper.sampleQueue.getUpstreamFormat() == null) {
         return;
+      }
+      synchronized (extraQueuesLock) {
+        List<SampleQueue> extraSampleQueues = loaderWrapper.extraSampleQueues;
+        for (int j = 0; j < extraSampleQueues.size(); j++) {
+          if (extraSampleQueues.get(j).getUpstreamFormat() == null) {
+            return;
+          }
+        }
       }
     }
 
     prepared = true;
+    rebuildFlatQueuesLocked();
     trackGroups = buildTrackGroups(ImmutableList.copyOf(rtspLoaderWrappers));
     checkNotNull(callback).onPrepared(/* mediaPeriod= */ this);
+  }
+
+  /**
+   * Rebuilds the flat index lists that map {@code MediaPeriod} track indices to sample queues.
+   * Called when preparation completes and whenever an MP2T elementary stream registers a new
+   * extra queue after a UDP-&gt;TCP fallback rebuilt the loader wrappers. Callers must hold {@link
+   * #extraQueuesLock} or be on the playback thread with the lock acquired inside.
+   */
+  private void rebuildFlatQueues() {
+    synchronized (extraQueuesLock) {
+      rebuildFlatQueuesLocked();
+    }
+  }
+
+  private void rebuildFlatQueuesLocked() {
+    ImmutableList<RtspLoaderWrapper> wrapperSnapshot = ImmutableList.copyOf(rtspLoaderWrappers);
+    ImmutableList.Builder<SampleQueue> queuesBuilder = new ImmutableList.Builder<>();
+    ImmutableList.Builder<RtspLoaderWrapper> wrappersBuilder = new ImmutableList.Builder<>();
+    for (int i = 0; i < wrapperSnapshot.size(); i++) {
+      RtspLoaderWrapper loaderWrapper = wrapperSnapshot.get(i);
+      queuesBuilder.add(loaderWrapper.sampleQueue);
+      wrappersBuilder.add(loaderWrapper);
+      List<SampleQueue> extraSampleQueues = loaderWrapper.extraSampleQueues;
+      for (int j = 0; j < extraSampleQueues.size(); j++) {
+        queuesBuilder.add(extraSampleQueues.get(j));
+        wrappersBuilder.add(loaderWrapper);
+      }
+    }
+    flatSampleQueues = queuesBuilder.build();
+    flatWrappers = wrappersBuilder.build();
   }
 
   /**
@@ -481,23 +592,62 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
    */
   private boolean seekInsideBufferUs(long positionUs) {
     for (int i = 0; i < rtspLoaderWrappers.size(); i++) {
-      SampleQueue sampleQueue = rtspLoaderWrappers.get(i).sampleQueue;
-      if (!sampleQueue.seekTo(positionUs, /* allowTimeBeyondBuffer= */ loadingFinished)) {
+      RtspLoaderWrapper loaderWrapper = rtspLoaderWrappers.get(i);
+      if (!loaderWrapper.sampleQueue.seekTo(positionUs, /* allowTimeBeyondBuffer= */ loadingFinished)) {
         return false;
+      }
+      List<SampleQueue> extraSampleQueues = loaderWrapper.extraSampleQueues;
+      synchronized (extraQueuesLock) {
+        for (int j = 0; j < extraSampleQueues.size(); j++) {
+          extraSampleQueues.get(j).seekTo(positionUs, /* allowTimeBeyondBuffer= */ loadingFinished);
+        }
       }
     }
     return true;
   }
 
   private void maybeSetupTracks() {
+    if (setupRequested || selectedLoadInfos.isEmpty()) {
+      return;
+    }
     boolean transportReady = true;
     for (int i = 0; i < selectedLoadInfos.size(); i++) {
       transportReady &= selectedLoadInfos.get(i).isTransportReady();
     }
 
-    if (transportReady && trackSelected) {
+    // MP2T sources must SETUP before track selection: their elementary-stream formats only
+    // surface once TS data flows, and data only flows after PLAY, which requires SETUP. ES-per-
+    // track sources (formats known from the SDP) keep the selection-gated SETUP.
+    if (transportReady && (trackSelected || selectedTracksAreAllMp2t())) {
+      setupRequested = true;
       rtspClient.setupSelectedTracks(selectedLoadInfos);
     }
+  }
+
+  private boolean tracksAreAllMp2t() {
+    if (rtspLoaderWrappers.isEmpty()) {
+      return false;
+    }
+    for (int i = 0; i < rtspLoaderWrappers.size(); i++) {
+      if (!MimeTypes.VIDEO_MP2T.equals(
+          rtspLoaderWrappers.get(i).loadInfo.mediaTrack.payloadFormat.format.sampleMimeType)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private boolean selectedTracksAreAllMp2t() {
+    if (selectedLoadInfos.isEmpty()) {
+      return false;
+    }
+    for (int i = 0; i < selectedLoadInfos.size(); i++) {
+      if (!MimeTypes.VIDEO_MP2T.equals(
+          selectedLoadInfos.get(i).mediaTrack.payloadFormat.format.sampleMimeType)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   private void updateLoadingFinished() {
@@ -510,12 +660,20 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   private static ImmutableList<TrackGroup> buildTrackGroups(
       ImmutableList<RtspLoaderWrapper> rtspLoaderWrappers) {
     ImmutableList.Builder<TrackGroup> listBuilder = new ImmutableList.Builder<>();
-    SampleQueue sampleQueue;
+    int groupId = 0;
     for (int i = 0; i < rtspLoaderWrappers.size(); i++) {
-      sampleQueue = rtspLoaderWrappers.get(i).sampleQueue;
+      RtspLoaderWrapper loaderWrapper = rtspLoaderWrappers.get(i);
       listBuilder.add(
           new TrackGroup(
-              /* id= */ Integer.toString(i), checkNotNull(sampleQueue.getUpstreamFormat())));
+              /* id= */ Integer.toString(groupId++),
+              checkNotNull(loaderWrapper.sampleQueue.getUpstreamFormat())));
+      List<SampleQueue> extraSampleQueues = loaderWrapper.extraSampleQueues;
+      for (int j = 0; j < extraSampleQueues.size(); j++) {
+        listBuilder.add(
+            new TrackGroup(
+                /* id= */ Integer.toString(groupId++),
+                checkNotNull(extraSampleQueues.get(j).getUpstreamFormat())));
+      }
     }
     return listBuilder.build();
   }
@@ -523,15 +681,39 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   // All interactions are on the loading thread
   private final class ExtractorOutputImpl implements ExtractorOutput {
 
-    private final TrackOutput trackOutput;
+    private final TrackOutput primaryOutput;
+    private final ExtraTrackOutputProvider extraProvider;
+    private final Runnable onExtraTrackRequested;
+    private boolean primaryGiven;
 
-    private ExtractorOutputImpl(TrackOutput trackOutput) {
-      this.trackOutput = trackOutput;
+    private ExtractorOutputImpl(
+        TrackOutput primaryOutput,
+        ExtraTrackOutputProvider extraProvider,
+        Runnable onExtraTrackRequested) {
+      this.primaryOutput = primaryOutput;
+      this.extraProvider = extraProvider;
+      this.onExtraTrackRequested = onExtraTrackRequested;
     }
 
     @Override
     public TrackOutput track(int id, int type) {
-      return trackOutput;
+      // An MP2T RTP track fans out into one TrackOutput per elementary stream (video, audio,
+      // subtitles...). The first registration is the primary output; every further one lands in
+      // its own sample queue so all elementary streams stay readable.
+      if (!primaryGiven) {
+        primaryGiven = true;
+        return primaryOutput;
+      }
+      TrackOutput extraOutput = extraProvider.requestTrack(type);
+      if (extraOutput == null) {
+        // Preparation already completed: the track group list is frozen, so a late elementary
+        // stream has no track to map to. Discard its samples instead of buffering them into an
+        // unreachable queue.
+        Log.w(TAG, "Discarding elementary stream registered after preparation, type=" + type);
+        return new DiscardingTrackOutput();
+      }
+      onExtraTrackRequested.run();
+      return extraOutput;
     }
 
     @Override
@@ -543,6 +725,61 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     public void seekMap(SeekMap seekMap) {
       // RTSP does not support seek map.
     }
+  }
+
+  /** Creates the sample queue for each elementary stream beyond the first of an RTP track. */
+  @FunctionalInterface
+  private interface ExtraTrackOutputProvider {
+
+    /**
+     * Returns the {@link TrackOutput} for an additionally registered elementary stream, or {@code
+     * null} if the stream cannot be mapped anymore (preparation already completed).
+     */
+    @Nullable
+    TrackOutput requestTrack(int trackType);
+  }
+
+  /** A {@link TrackOutput} that silently drops all samples of an unmappable elementary stream. */
+  private static final class DiscardingTrackOutput implements TrackOutput {
+
+    private static final int SCRATCH_SIZE = 4096;
+
+    private final byte[] scratch = new byte[SCRATCH_SIZE];
+
+    @Override
+    public void format(Format format) {}
+
+    @Override
+    public int sampleData(
+        DataReader input,
+        int length,
+        boolean allowEndOfInput,
+        @TrackOutput.SampleDataPart int sampleDataPart)
+        throws IOException {
+      int remaining = length;
+      while (remaining > 0) {
+        int read = input.read(scratch, 0, Math.min(remaining, SCRATCH_SIZE));
+        if (read == C.RESULT_END_OF_INPUT) {
+          break;
+        }
+        remaining -= read;
+      }
+      return length - remaining;
+    }
+
+    @Override
+    public void sampleData(
+        ParsableByteArray data, int length, @TrackOutput.SampleDataPart int sampleDataPart) {
+      data.skipBytes(length);
+    }
+
+    @Override
+    public void sampleMetadata(
+        long timeUs,
+        @C.BufferFlags int flags,
+        int size,
+        int offset,
+        @Nullable TrackOutput.CryptoData cryptoData) {}
   }
 
   private final class InternalListener
@@ -709,6 +946,14 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
         loaderWrapper.startLoading();
       }
 
+      // MP2T sources complete SETUP before selection (see maybeSetupTracks): their tracks are
+      // always SETUP as a whole, since all elementary streams share the one RTP track.
+      if (tracksAreAllMp2t()) {
+        for (int i = 0; i < rtspLoaderWrappers.size(); i++) {
+          selectedLoadInfos.add(rtspLoaderWrappers.get(i).loadInfo);
+        }
+      }
+
       listener.onSourceInfoRefreshed(timing);
     }
 
@@ -721,6 +966,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   private void retryWithRtpTcp() {
     // Retry should only run once.
     isUsingRtpTcp = true;
+    setupRequested = false;
 
     rtspClient.retryWithRtpTcp();
 
@@ -761,6 +1007,9 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     rtspLoaderWrappers.addAll(newLoaderWrappers);
     selectedLoadInfos.clear();
     selectedLoadInfos.addAll(newSelectedLoadInfos);
+    // The flat index lists still reference the canceled queues; rebuild them so reads drain the
+    // fresh queues. MP2T extra queues register asynchronously and trigger further rebuilds.
+    rebuildFlatQueues();
 
     // Cancel old loadable wrappers after switching, so that buffered position is always read from
     // active sample queues.
@@ -807,6 +1056,12 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
     private final Loader loader;
     private final SampleQueue sampleQueue;
+    /**
+     * Sample queues for the elementary streams beyond the first one of this RTP track (MP2T
+     * sources). Guarded by {@link #extraQueuesLock}; created on the loading thread, read on the
+     * playback thread.
+     */
+    public final List<SampleQueue> extraSampleQueues;
     private boolean canceled;
     private boolean released;
 
@@ -819,37 +1074,36 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
         RtspMediaTrack mediaTrack, int trackId, RtpDataChannel.Factory rtpDataChannelFactory) {
       loader = new Loader("ExoPlayer:RtspMediaPeriod:RtspLoaderWrapper " + trackId);
       sampleQueue = SampleQueue.createWithoutDrm(allocator);
-      loadInfo = new RtpLoadInfo(mediaTrack, trackId, sampleQueue, rtpDataChannelFactory);
+      extraSampleQueues = new ArrayList<>();
+      loadInfo =
+          new RtpLoadInfo(
+              mediaTrack, trackId, sampleQueue, extraSampleQueues, rtpDataChannelFactory);
       sampleQueue.setUpstreamFormatChangeListener(internalListener);
     }
 
     /**
      * Returns the largest buffered position in microseconds; or {@link Long#MIN_VALUE} if no sample
-     * has been queued.
+     * has been queued. Takes the minimum across extra queues: playback can only advance as far as
+     * the slowest elementary stream of the track.
      */
     public long getBufferedPositionUs() {
-      return sampleQueue.getLargestQueuedTimestampUs();
+      long positionUs = sampleQueue.getLargestQueuedTimestampUs();
+      synchronized (extraQueuesLock) {
+        for (int i = 0; i < extraSampleQueues.size(); i++) {
+          long extraPositionUs = extraSampleQueues.get(i).getLargestQueuedTimestampUs();
+          if (extraPositionUs != Long.MIN_VALUE) {
+            positionUs =
+                positionUs == Long.MIN_VALUE ? extraPositionUs : min(positionUs, extraPositionUs);
+          }
+        }
+      }
+      return positionUs;
     }
 
     /** Starts loading. */
     public void startLoading() {
       loader.startLoading(
           loadInfo.loadable, /* callback= */ internalListener, /* defaultMinRetryCount= */ 0);
-    }
-
-    public boolean isSampleQueueReady() {
-      return sampleQueue.isReady(/* loadingFinished= */ canceled);
-    }
-
-    public @ReadDataResult int read(
-        FormatHolder formatHolder, DecoderInputBuffer buffer, @ReadFlags int readFlags) {
-      return sampleQueue.read(formatHolder, buffer, readFlags, /* loadingFinished= */ canceled);
-    }
-
-    public int skipData(long positionUs) {
-      int skipCount = sampleQueue.getSkipCount(positionUs, /* allowEndOfQueue= */ canceled);
-      sampleQueue.skip(skipCount);
-      return skipCount;
     }
 
     /** Cancels loading. */
@@ -871,12 +1125,18 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       startLoading();
     }
 
-    /** Resets the {@link Loadable} and {@link SampleQueue} to prepare for an RTSP seek. */
+    /** Resets the {@link Loadable} and {@link SampleQueue}s to prepare for an RTSP seek. */
     public void seekTo(long positionUs) {
       if (!canceled) {
         loadInfo.loadable.resetForSeek();
         sampleQueue.reset();
         sampleQueue.setStartTimeUs(positionUs);
+        synchronized (extraQueuesLock) {
+          for (int i = 0; i < extraSampleQueues.size(); i++) {
+            extraSampleQueues.get(i).reset();
+            extraSampleQueues.get(i).setStartTimeUs(positionUs);
+          }
+        }
       }
     }
 
@@ -887,6 +1147,11 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       }
       loader.release();
       sampleQueue.release();
+      synchronized (extraQueuesLock) {
+        for (int i = 0; i < extraSampleQueues.size(); i++) {
+          extraSampleQueues.get(i).release();
+        }
+      }
       released = true;
     }
   }
@@ -904,7 +1169,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     public RtpLoadInfo(
         RtspMediaTrack mediaTrack,
         int trackId,
-        TrackOutput trackOutput,
+        SampleQueue primarySampleQueue,
+        List<SampleQueue> extraSampleQueues,
         RtpDataChannel.Factory rtpDataChannelFactory) {
       this.mediaTrack = mediaTrack;
 
@@ -924,13 +1190,34 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
             maybeSetupTracks();
           };
 
+      ExtraTrackOutputProvider extraProvider =
+          type -> {
+            // Called on the loading thread while the TS extractor registers elementary streams.
+            synchronized (extraQueuesLock) {
+              if (prepared) {
+                // Preparation completed: track groups are frozen, the caller discards the stream.
+                return null;
+              }
+              SampleQueue extraSampleQueue = SampleQueue.createWithoutDrm(allocator);
+              extraSampleQueue.setUpstreamFormatChangeListener(internalListener);
+              extraSampleQueues.add(extraSampleQueue);
+              return extraSampleQueue;
+            }
+          };
+
       this.loadable =
           new RtpDataLoadable(
               trackId,
               mediaTrack,
               /* eventListener= */ transportEventListener,
-              /* output= */ new ExtractorOutputImpl(trackOutput),
+              /* output= */ new ExtractorOutputImpl(
+                  primarySampleQueue, extraProvider, () -> handler.post(this::onExtraTrackQueued)),
               rtpDataChannelFactory);
+    }
+
+    private void onExtraTrackQueued() {
+      maybeFinishPrepare();
+      rebuildFlatQueues();
     }
 
     /**
