@@ -320,7 +320,6 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
           rtpPacketDataBuffer.reset(packet.payloadData);
 
           payloadReader.consume(
-
               rtpPacketDataBuffer, packet.timestamp, packet.sequenceNumber, packet.marker);
 
           packet = reorderingQueue.poll(packetCutoffTimeMs);

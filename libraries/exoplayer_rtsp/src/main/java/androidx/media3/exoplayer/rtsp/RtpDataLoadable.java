@@ -70,6 +70,11 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   @Nullable private volatile String transport;
   private volatile long pendingSeekPositionUs;
   private volatile long nextRtpTimestamp;
+  /**
+   * Reused across the {@link #load()} read loop; allocating a fresh holder per RTP packet adds up
+   * at RTSP packet rates.
+   */
+  private final PositionHolder positionHolder;
 
   /**
    * Creates an {@link RtpDataLoadable} that listens on incoming RTP traffic.
@@ -98,6 +103,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     receivedRtpPacket = false;
     cancelledByCaller = false;
     pendingSeekPositionUs = C.TIME_UNSET;
+    positionHolder = new PositionHolder();
   }
 
   /**
@@ -169,8 +175,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
         @Extractor.ReadResult
         int readResult =
-            checkNotNull(extractor)
-                .read(checkNotNull(extractorInput), /* seekPosition= */ new PositionHolder());
+            checkNotNull(extractor).read(checkNotNull(extractorInput), /* seekPosition= */ positionHolder);
         if (readResult == Extractor.RESULT_END_OF_INPUT) {
           // End-of-input from a real RTP channel is normally a read timeout. Keep the reason before
           // the UDP channel is closed so the MediaPeriod can distinguish AUTO fallback from a
