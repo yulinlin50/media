@@ -23,6 +23,7 @@ import androidx.media3.common.MimeTypes;
 import androidx.media3.common.ParserException;
 import androidx.media3.common.util.ParsableByteArray;
 import androidx.media3.container.NalUnitUtil;
+import androidx.media3.common.C;
 import androidx.media3.exoplayer.rtsp.RtpPacket;
 import androidx.media3.exoplayer.rtsp.RtpPayloadFormat;
 import androidx.media3.test.utils.FakeExtractorOutput;
@@ -212,6 +213,59 @@ public class RtpH264ReaderTest {
     FakeTrackOutput trackOutput = extractorOutput.trackOutputs.get(0);
     // Should discard the entire AU because it's corrupted.
     assertThat(trackOutput.getSampleCount()).isEqualTo(0);
+  }
+
+  @Test
+  public void consume_stapAWithIdrNalUnit_reportsKeyFrame() throws ParserException {
+    rtpH264Reader.createTracks(extractorOutput, /* trackId= */ 0);
+    rtpH264Reader.onReceivingFirstPacket(
+        VALID_STAP_A_PACKET.timestamp, VALID_STAP_A_PACKET.sequenceNumber);
+
+    // VALID_STAP_A_PACKET's second NAL unit header is 0x65 (IDR, type 5).
+    consume(rtpH264Reader, VALID_STAP_A_PACKET);
+
+    FakeTrackOutput trackOutput = extractorOutput.trackOutputs.get(0);
+    assertThat(trackOutput.getSampleCount()).isEqualTo(1);
+    assertThat(trackOutput.getSampleFlags(0)).isEqualTo(C.BUFFER_FLAG_KEY_FRAME);
+  }
+
+  @Test
+  public void consume_stapACompletingFuAIdrAccessUnit_keepsKeyFrameFlag() throws ParserException {
+    long auTimestamp = 9_000_000;
+    // Packet 1: FU-A Start for an IDR NAL unit (S=1, E=0, type 5), marker = false.
+    RtpPacket fuStart =
+        createFragmentedPacket(
+            /* sequenceNumber= */ 100,
+            auTimestamp,
+            /* marker= */ false,
+            ImmutableByteArray.ofHexString("85"),
+            ImmutableByteArray.ofHexString("0102"));
+    // Packet 2: FU-A End (S=0, E=1, type 5), marker = false.
+    RtpPacket fuEnd =
+        createFragmentedPacket(
+            /* sequenceNumber= */ 101,
+            auTimestamp,
+            /* marker= */ false,
+            ImmutableByteArray.ofHexString("45"),
+            ImmutableByteArray.ofHexString("0304"));
+    // Packet 3: STAP-A carrying only a non-IDR NAL unit, marker = true; completes the access
+    // unit. The key-frame flag set by the FU-A IDR fragments must not be cleared (issue 3434).
+    RtpPacket stapA =
+        createAggregationPacket(
+            /* sequenceNumber= */ 102,
+            auTimestamp,
+            NALU_1_LENGTH,
+            ImmutableByteArray.concat(NALU_1_HEADER, NALU_1_PAYLOAD));
+
+    rtpH264Reader.createTracks(extractorOutput, /* trackId= */ 0);
+    rtpH264Reader.onReceivingFirstPacket(fuStart.timestamp, fuStart.sequenceNumber);
+    consume(rtpH264Reader, fuStart);
+    consume(rtpH264Reader, fuEnd);
+    consume(rtpH264Reader, stapA);
+
+    FakeTrackOutput trackOutput = extractorOutput.trackOutputs.get(0);
+    assertThat(trackOutput.getSampleCount()).isEqualTo(1);
+    assertThat(trackOutput.getSampleFlags(0)).isEqualTo(C.BUFFER_FLAG_KEY_FRAME);
   }
 
   @Test

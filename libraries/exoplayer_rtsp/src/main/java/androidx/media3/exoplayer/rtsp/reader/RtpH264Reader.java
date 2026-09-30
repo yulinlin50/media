@@ -238,13 +238,14 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
     int nalUnitLength;
     while (data.bytesLeft() > 4) {
       nalUnitLength = data.readUnsignedShort();
+      // The first payload byte of each aggregated NAL unit is its NAL header; an IDR NAL makes
+      // the access unit a key frame. Flags already set by earlier packets of the same access
+      // unit (e.g. FU-A IDR fragments) must be preserved (upstream issue 3434).
+      bufferFlags |= getBufferFlagsFromNalType(data.peekUnsignedByte() & 0x1F);
       fragmentedSampleSizeBytes += writeStartCode();
       trackOutput.sampleData(data, nalUnitLength);
       fragmentedSampleSizeBytes += nalUnitLength;
     }
-
-    // Treat Aggregated NAL units as non key frames.
-    bufferFlags = 0;
   }
 
   /**
