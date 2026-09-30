@@ -98,9 +98,10 @@ import java.util.regex.Pattern;
  private static final Pattern CONTENT_LENGTH_HEADER_PATTERN =
      Pattern.compile("Content-Length:\\s?(\\d+)", CASE_INSENSITIVE);
 
- // Session header pattern, see RFC2326 Sections 3.4 and 12.37.
+ // Session header pattern, see RFC2326 Sections 3.4 and 12.37. Carrier servers issue session IDs
+ // outside the [\w$\-_.+]+ character set, so accept anything up to the parameter separator.
  private static final Pattern SESSION_HEADER_PATTERN =
-     Pattern.compile("([\\w$\\-_.+]+)(?:;\\s?timeout=(\\d+))?");
+     Pattern.compile("([^;\\s]+)(?:;\\s?timeout=(\\d+))?");
 
  // Only these messages are authored by the fork and are safe to expose. Parser, socket and
  // server-controlled messages are otherwise replaced with a generic message.
@@ -301,6 +302,8 @@ import java.util.regex.Pattern;
        || value.equals("RTSP control request timeout")
        || value.equals("No fallback data channel factory for TCP retry")
        || value.equals("REDIRECT_UNSUPPORTED")
+       || value.equals("REDIRECT_LIMIT_REACHED")
+       || value.equals("REDIRECT_CONNECT_FAILED")
        || value.equals("UDP_TO_TCP")
        || value.equals("RTSP playback failed")
        || value.equals("RTSP request failed")

@@ -52,8 +52,11 @@ import java.net.Socket;
 import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.Executor;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.net.SocketFactory;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
@@ -89,6 +92,21 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
    * KeepAliveMonitor#intervalMs}.
    */
   private static final int DEFAULT_RTSP_KEEP_ALIVE_INTERVAL_DIVISOR = 2;
+
+  /**
+   * Maximum redirection hops (3xx responses and SMIL redirects combined) before the session is
+   * failed, guarding against redirect loops.
+   */
+  private static final int MAX_REDIRECT_COUNT = 10;
+
+  /**
+   * Matches the {@code src} attribute of a {@code <video>} or {@code <ref>} element in a SMIL
+   * document. Carrier IPTV servers occasionally answer DESCRIBE with SMIL instead of SDP; the
+   * first {@code src} then holds the URI of the actual stream to DESCRIBE.
+   */
+  private static final Pattern SMIL_SRC_PATTERN =
+      Pattern.compile(
+          "<(?:video|ref)\\b[^>]*\\bsrc\\s*=\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE);
 
   /** A listener for session information update. */
   public interface SessionInfoListener {
@@ -153,6 +171,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   private boolean receivedAuthorizationRequest;
   private boolean hasPendingPauseRequest;
   private long pendingSeekPositionUs;
+  /** Combined count of 3xx and SMIL redirection hops followed for the current DESCRIBE chain. */
+  private int redirectCount;
 
   /**
    * Creates a new instance.
@@ -451,6 +471,51 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       }
     }
     return trackListBuilder.build();
+  }
+
+  /**
+   * Extracts the first stream URI from a SMIL XML response body, or {@code null} if the body is
+   * not SMIL.
+   *
+   * <p>Some IPTV servers respond to DESCRIBE with a SMIL document instead of SDP; the real stream
+   * URI then sits in the first {@code <video src>} or {@code <ref src>} element and a second
+   * DESCRIBE must be issued against it. Detection prefers the {@code Content-Type} header and
+   * falls back to sniffing the body, because servers omit the header in practice.
+   */
+  @Nullable
+  private static Uri extractSmilStreamUri(String body, @Nullable String contentType, Uri baseUri) {
+    String normalizedContentType =
+        contentType == null ? null : contentType.toLowerCase(Locale.US);
+    boolean isSmilByHeader =
+        normalizedContentType != null
+            && (normalizedContentType.contains("smil") || normalizedContentType.contains("/xml"));
+    if (!isSmilByHeader) {
+      String trimmed = body.trim();
+      if (!trimmed.startsWith("<?xml") && !trimmed.regionMatches(true, 0, "<smil", 0, 5)) {
+        return null;
+      }
+    }
+    Matcher matcher = SMIL_SRC_PATTERN.matcher(body.trim());
+    if (!matcher.find()) {
+      return null;
+    }
+    String src = matcher.group(1);
+    if (src == null || src.isEmpty()) {
+      return null;
+    }
+    if (src.contains("://")) {
+      return Uri.parse(src);
+    }
+    try {
+      return Uri.parse(java.net.URI.create(baseUri.toString()).resolve(src).toString());
+    } catch (IllegalArgumentException | UnsupportedOperationException e) {
+      // Relative reference that java.net.URI cannot resolve against the base: fall back to
+      // prefixing the base path. Never crashes on malformed server input.
+      String base = baseUri.toString();
+      int lastSlash = base.lastIndexOf('/');
+      String resolved = lastSlash >= 0 ? base.substring(0, lastSlash + 1) + src : base + "/" + src;
+      return Uri.parse(resolved);
+    }
   }
 
   private final class MessageSender {
@@ -766,6 +831,12 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
             if (redirectionUriString == null) {
               sessionInfoListener.onSessionTimelineRequestFailed(
                   "Redirection without new location.", /* cause= */ null);
+            } else if (++redirectCount > MAX_REDIRECT_COUNT) {
+              dispatchRtspError(
+                  new RtspPlaybackException("REDIRECT_LIMIT_REACHED"),
+                  matchingRequest,
+                  response.status,
+                  "REDIRECT_LIMIT_REACHED");
             } else {
               Uri redirectedUri = Uri.parse(redirectionUriString);
               Uri sanitizedRedirectUri = RtspMessageUtil.removeUserInfo(redirectedUri);
@@ -780,7 +851,33 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
               RtspClient.this.uri = sanitizedRedirectUri;
               // Source-level credentials may be reused only for the same authority. Never parse or
               // forward userinfo from a Location header.
-              messageSender.sendDescribeRequest(RtspClient.this.uri, RtspClient.this.sessionId);
+              // Carrier servers reject a re-DESCRIBE on the redirected channel: reopen the
+              // connection and restart the OPTIONS/DESCRIBE sequence on a clean session.
+              emitProtocolEvent(
+                  RtspMessageUtil.toMethodString(requestMethod),
+                  response.status,
+                  "REDIRECT",
+                  "RECONNECT",
+                  requestedTransport(matchingRequest),
+                  /* selectedTransport= */ null);
+              try {
+                messageChannel.close();
+                messageChannel = new RtspMessageChannel(new MessageListener());
+                messageChannel.open(getSocket(RtspClient.this.uri));
+                sessionId = null;
+                pendingRequests.clear();
+                // The new channel must not inherit the authentication state of the redirected one
+                // (a 401 handshake on the old channel would poison the new session).
+                receivedAuthorizationRequest = false;
+                rtspAuthenticationInfo = null;
+                messageSender.sendOptionsRequest(RtspClient.this.uri, null);
+              } catch (IOException e) {
+                dispatchRtspError(
+                    new RtspPlaybackException("REDIRECT_CONNECT_FAILED", e),
+                    matchingRequest,
+                    response.status,
+                    "REDIRECT_CONNECT_FAILED");
+              }
             }
             return;
           case 401:
@@ -850,6 +947,43 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
             break;
 
           case METHOD_DESCRIBE:
+            @Nullable String contentType = response.headers.get(RtspHeaders.CONTENT_TYPE);
+            @Nullable Uri smilStreamUri =
+                extractSmilStreamUri(response.messageBody, contentType, uri);
+            if (smilStreamUri != null) {
+              // DESCRIBE answered with SMIL instead of SDP: the hop to the real stream URI is a
+              // redirect and obeys the same same-authority rule as a 3xx Location.
+              if (++redirectCount > MAX_REDIRECT_COUNT) {
+                dispatchRtspError(
+                    new RtspPlaybackException("REDIRECT_LIMIT_REACHED"),
+                    matchingRequest,
+                    response.status,
+                    "REDIRECT_LIMIT_REACHED");
+                return;
+              }
+              Uri sanitizedSmilUri = RtspMessageUtil.removeUserInfo(smilStreamUri);
+              if (!initialAuthority.equals(authorityKey(sanitizedSmilUri))) {
+                dispatchRtspError(
+                    new RtspPlaybackException("REDIRECT_UNSUPPORTED"),
+                    matchingRequest,
+                    response.status,
+                    "REDIRECT_UNSUPPORTED");
+                return;
+              }
+              RtspClient.this.uri = sanitizedSmilUri;
+              emitProtocolEvent(
+                  RtspMessageUtil.toMethodString(requestMethod),
+                  response.status,
+                  "REDIRECT",
+                  "SMIL",
+                  requestedTransport(matchingRequest),
+                  /* selectedTransport= */ null);
+              // SMIL targets live on the same server; reuse the current channel.
+              messageSender.sendDescribeRequest(RtspClient.this.uri, sessionId);
+              return;
+            }
+            // A DESCRIBE that answered with SDP ends the redirect chain.
+            redirectCount = 0;
             onDescribeResponseReceived(
                 new RtspDescribeResponse(
                     response.headers,
