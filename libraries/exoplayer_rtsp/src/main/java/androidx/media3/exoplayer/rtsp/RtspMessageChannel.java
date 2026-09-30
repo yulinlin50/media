@@ -470,30 +470,22 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     private ImmutableList<String> addMessageBody(byte[] messageBodyBytes) {
       checkState(state == STATE_READING_BODY);
 
-      String messageBody;
-      if (messageBodyBytes.length > 0
-          && messageBodyBytes[messageBodyBytes.length - 1] == Ascii.LF) {
-        if (messageBodyBytes.length > 1
-            && messageBodyBytes[messageBodyBytes.length - 2] == Ascii.CR) {
-          // Line ends with CRLF.
-          messageBody =
-              new String(
-                  messageBodyBytes,
-                  /* offset= */ 0,
-                  /* length= */ messageBodyBytes.length - 2,
-                  CHARSET);
-        } else {
-          // Line ends with LF.
-          messageBody =
-              new String(
-                  messageBodyBytes,
-                  /* offset= */ 0,
-                  /* length= */ messageBodyBytes.length - 1,
-                  CHARSET);
-        }
-      } else {
-        throw new IllegalArgumentException("Message body is empty or does not end with a LF.");
+      // Bodies of carrier servers do not always end with a line terminator (SMIL/XML responses end
+      // with their closing tag). Only strip a terminator when one is present: rejecting
+      // newline-less bodies throws on the reader thread, which silently kills the connection and
+      // hangs the session until the control request timeout.
+      int bodyLength = messageBodyBytes.length;
+      if (bodyLength > 1
+          && messageBodyBytes[bodyLength - 2] == Ascii.CR
+          && messageBodyBytes[bodyLength - 1] == Ascii.LF) {
+        // Body ends with CRLF.
+        bodyLength -= 2;
+      } else if (bodyLength > 0 && messageBodyBytes[bodyLength - 1] == Ascii.LF) {
+        // Body ends with LF.
+        bodyLength -= 1;
       }
+      String messageBody =
+          new String(messageBodyBytes, /* offset= */ 0, /* length= */ bodyLength, CHARSET);
 
       messageLines.add(messageBody);
       ImmutableList<String> linesToReturn = ImmutableList.copyOf(messageLines);
