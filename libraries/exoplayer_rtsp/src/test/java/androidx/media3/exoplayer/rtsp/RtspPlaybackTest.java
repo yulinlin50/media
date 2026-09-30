@@ -84,6 +84,9 @@ public final class RtspPlaybackTest {
   private RtpPacketStreamDump aacRtpPacketStreamDump;
   // ExoPlayer does not support extracting MP4A-LATM RTP payload at the moment.
   private RtpPacketStreamDump mpeg2tsRtpPacketStreamDump;
+  // Despite the file name, the upstream mpeg2ts dump actually carries an unsupported MP4 payload;
+  // mp2t is the real MPEG-2 TS dump used by the MP2T-over-RTP coverage.
+  private RtpPacketStreamDump mp2tRtpPacketStreamDump;
   private RtspServer rtspServer;
 
   @Rule
@@ -98,6 +101,7 @@ public final class RtspPlaybackTest {
     aacRtpPacketStreamDump = RtspTestUtils.readRtpPacketStreamDump("media/rtsp/aac-dump.json");
     mpeg2tsRtpPacketStreamDump =
         RtspTestUtils.readRtpPacketStreamDump("media/rtsp/mpeg2ts-dump.json");
+    mp2tRtpPacketStreamDump = RtspTestUtils.readRtpPacketStreamDump("media/rtsp/mp2t-dump.json");
   }
 
   @After
@@ -218,6 +222,223 @@ public final class RtspPlaybackTest {
   }
 
   @Test
+  public void prepare_withMp2tTrack_playsTrackUntilEnded() throws Exception {
+    FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
+    RtpDataChannel.Factory rtpDataChannelFactory = (trackId) -> fakeRtpDataChannel;
+    ResponseProvider responseProvider =
+        new ResponseProvider(
+            clock,
+            ImmutableList.of(mp2tRtpPacketStreamDump),
+            fakeRtpDataChannel,
+            RtspMessageUtil.DEFAULT_RTSP_TIMEOUT_MS,
+            /* optionsRequestCounter= */ Optional.empty());
+    rtspServer = new RtspServer(responseProvider);
+    ExoPlayer player = createExoPlayer(rtspServer.startAndGetPortNumber(), rtpDataChannelFactory);
+
+    player.prepare();
+    player.play();
+    TestPlayerRunHelper.runUntilPlaybackState(player, Player.STATE_ENDED);
+    player.release();
+
+    // MP2T (RFC 2250 static payload type 33) is now a supported payload: the RTP track is SETUP
+    // and its TS content plays through the embedded TS extractor.
+    assertThat(responseProvider.getDumpsForSetUpTracks())
+        .containsExactly(mp2tRtpPacketStreamDump);
+  }
+
+  @Test
+  public void prepare_describeRespondsSmil_followsHopAndPlays() throws Exception {
+    FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
+    RtpDataChannel.Factory rtpDataChannelFactory = (trackId) -> fakeRtpDataChannel;
+    AtomicInteger describeCount = new AtomicInteger();
+    ResponseProvider responseProvider =
+        new ResponseProvider(
+            clock,
+            ImmutableList.of(aacRtpPacketStreamDump),
+            fakeRtpDataChannel,
+            RtspMessageUtil.DEFAULT_RTSP_TIMEOUT_MS,
+            /* optionsRequestCounter= */ Optional.empty()) {
+          @Override
+          public RtspResponse getDescribeResponse(Uri requestedUri, RtspHeaders headers) {
+            if (describeCount.getAndIncrement() == 0) {
+              // The first DESCRIBE answers with SMIL pointing at a path on the same server.
+              String smilBody =
+                  "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                      + "<smil><body><video src=\""
+                      + requestedUri.toString()
+                      + "/stream.sdp\"/></body></smil>";
+              return new RtspResponse(
+                  /* status= */ 200,
+                  new RtspHeaders.Builder()
+                      .add(RtspHeaders.CONTENT_TYPE, "application/smil")
+                      .add(
+                          RtspHeaders.CONTENT_LENGTH,
+                          String.valueOf(smilBody.getBytes(RtspMessageChannel.CHARSET).length))
+                      .build(),
+                  /* messageBody= */ smilBody);
+            }
+            return super.getDescribeResponse(requestedUri, headers);
+          }
+        };
+    rtspServer = new RtspServer(responseProvider);
+    ExoPlayer player = createExoPlayer(rtspServer.startAndGetPortNumber(), rtpDataChannelFactory);
+
+    player.prepare();
+    player.play();
+    TestPlayerRunHelper.runUntilPlaybackState(player, Player.STATE_ENDED);
+    player.release();
+
+    assertThat(describeCount.get()).isEqualTo(2);
+    assertThat(responseProvider.getDumpsForSetUpTracks())
+        .containsExactly(aacRtpPacketStreamDump);
+  }
+
+  @Test
+  public void prepare_smilRedirectLoop_failsWithRedirectLimit() throws Exception {
+    FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
+    RtpDataChannel.Factory rtpDataChannelFactory = (trackId) -> fakeRtpDataChannel;
+    AtomicInteger describeCount = new AtomicInteger();
+    ResponseProvider responseProvider =
+        new ResponseProvider(
+            clock,
+            ImmutableList.of(aacRtpPacketStreamDump),
+            fakeRtpDataChannel,
+            RtspMessageUtil.DEFAULT_RTSP_TIMEOUT_MS,
+            /* optionsRequestCounter= */ Optional.empty()) {
+          @Override
+          public RtspResponse getDescribeResponse(Uri requestedUri, RtspHeaders headers) {
+            describeCount.incrementAndGet();
+            // Every DESCRIBE answers with SMIL pointing back at itself: a redirect loop.
+            String smilBody =
+                "<smil><body><video src=\"" + requestedUri.toString() + "\"/></body></smil>";
+            return new RtspResponse(
+                /* status= */ 200,
+                new RtspHeaders.Builder()
+                    .add(RtspHeaders.CONTENT_TYPE, "application/smil")
+                    .add(
+                        RtspHeaders.CONTENT_LENGTH,
+                        String.valueOf(smilBody.getBytes(RtspMessageChannel.CHARSET).length))
+                    .build(),
+                /* messageBody= */ smilBody);
+          }
+        };
+    rtspServer = new RtspServer(responseProvider);
+    ExoPlayer player = createExoPlayer(rtspServer.startAndGetPortNumber(), rtpDataChannelFactory);
+
+    AtomicReference<Throwable> playbackError = new AtomicReference<>();
+    player.prepare();
+    player.addListener(
+        new Listener() {
+          @Override
+          public void onPlayerError(PlaybackException error) {
+            playbackError.set(error);
+          }
+        });
+    RobolectricUtil.runMainLooperUntil(() -> playbackError.get() != null);
+    player.release();
+
+    // 1 initial DESCRIBE + 10 hops, then the client refuses to follow any further.
+    assertThat(describeCount.get()).isEqualTo(11);
+    assertThat(playbackError.get())
+        .hasCauseThat()
+        .hasMessageThat()
+        .contains("REDIRECT_LIMIT_REACHED");
+  }
+
+  @Test
+  public void prepare_smilPointsToDifferentAuthority_failsWithRedirectUnsupported()
+      throws Exception {
+    FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
+    RtpDataChannel.Factory rtpDataChannelFactory = (trackId) -> fakeRtpDataChannel;
+    AtomicInteger describeCount = new AtomicInteger();
+    ResponseProvider responseProvider =
+        new ResponseProvider(
+            clock,
+            ImmutableList.of(aacRtpPacketStreamDump),
+            fakeRtpDataChannel,
+            RtspMessageUtil.DEFAULT_RTSP_TIMEOUT_MS,
+            /* optionsRequestCounter= */ Optional.empty()) {
+          @Override
+          public RtspResponse getDescribeResponse(Uri requestedUri, RtspHeaders headers) {
+            describeCount.incrementAndGet();
+            String smilBody =
+                "<smil><body><video src=\"rtsp://other.example.com:8554/stream\"/></body></smil>";
+            return new RtspResponse(
+                /* status= */ 200,
+                new RtspHeaders.Builder()
+                    .add(RtspHeaders.CONTENT_TYPE, "application/smil")
+                    .add(
+                        RtspHeaders.CONTENT_LENGTH,
+                        String.valueOf(smilBody.getBytes(RtspMessageChannel.CHARSET).length))
+                    .build(),
+                /* messageBody= */ smilBody);
+          }
+        };
+    rtspServer = new RtspServer(responseProvider);
+    ExoPlayer player = createExoPlayer(rtspServer.startAndGetPortNumber(), rtpDataChannelFactory);
+
+    AtomicReference<Throwable> playbackError = new AtomicReference<>();
+    player.prepare();
+    player.addListener(
+        new Listener() {
+          @Override
+          public void onPlayerError(PlaybackException error) {
+            playbackError.set(error);
+          }
+        });
+    RobolectricUtil.runMainLooperUntil(() -> playbackError.get() != null);
+    player.release();
+
+    // The SMIL hop is a redirect: crossing to another authority is rejected, not followed.
+    assertThat(describeCount.get()).isEqualTo(1);
+    assertThat(playbackError.get())
+        .hasCauseThat()
+        .hasMessageThat()
+        .contains("REDIRECT_UNSUPPORTED");
+  }
+
+  @Test
+  public void prepare_describeRedirectsSameAuthority_reconnectsAndPlays() throws Exception {
+    FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
+    RtpDataChannel.Factory rtpDataChannelFactory = (trackId) -> fakeRtpDataChannel;
+    AtomicInteger describeCount = new AtomicInteger();
+    ResponseProvider responseProvider =
+        new ResponseProvider(
+            clock,
+            ImmutableList.of(aacRtpPacketStreamDump),
+            fakeRtpDataChannel,
+            RtspMessageUtil.DEFAULT_RTSP_TIMEOUT_MS,
+            /* optionsRequestCounter= */ Optional.empty()) {
+          @Override
+          public RtspResponse getDescribeResponse(Uri requestedUri, RtspHeaders headers) {
+            if (describeCount.getAndIncrement() == 0) {
+              // First DESCRIBE redirects to another path on the same server.
+              return new RtspResponse(
+                  /* status= */ 302,
+                  new RtspHeaders.Builder()
+                      .add(RtspHeaders.LOCATION, requestedUri.toString() + "/moved")
+                      .build());
+            }
+            return super.getDescribeResponse(requestedUri, headers);
+          }
+        };
+    rtspServer = new RtspServer(responseProvider);
+    ExoPlayer player = createExoPlayer(rtspServer.startAndGetPortNumber(), rtpDataChannelFactory);
+
+    player.prepare();
+    player.play();
+    TestPlayerRunHelper.runUntilPlaybackState(player, Player.STATE_ENDED);
+    player.release();
+
+    // The client must reconnect to the redirected URI instead of re-DESCRIBEing on the old
+    // channel: two DESCRIBEs over two connections, then normal playback.
+    assertThat(describeCount.get()).isEqualTo(2);
+    assertThat(requestsOfMethod(METHOD_DESCRIBE)).hasSize(2);
+    assertThat(responseProvider.getDumpsForSetUpTracks())
+        .containsExactly(aacRtpPacketStreamDump);
+  }
+
+  @Test
   public void prepare_withUdpUnsupportedWithFallback_fallsbackToTcpAndPlaysUntilEnd()
       throws Exception {
     FakeTcpDataSourceRtpDataChannel fakeTcpRtpDataChannel = new FakeTcpDataSourceRtpDataChannel();
@@ -303,14 +524,15 @@ public final class RtspPlaybackTest {
         createExoPlayer(rtspServer.startAndGetPortNumber(), forwardingRtpDataChannelFactory);
 
     AtomicReference<PlaybackException> playbackError = new AtomicReference<>();
-    player.prepare();
     player.addListener(
         new Listener() {
           @Override
           public void onPlayerError(PlaybackException error) {
             playbackError.set(error);
           }
+
         });
+    player.prepare();
     RobolectricUtil.runMainLooperUntil(() -> playbackError.get() != null);
     player.release();
 
