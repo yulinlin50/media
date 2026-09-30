@@ -330,6 +330,10 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     }
     pendingRequestTimeouts.clear();
     pendingRequests.clear();
+    // Drop stale SETUP entries so a 461-triggered UDP->TCP fallback re-SETUPs with the fresh
+    // TCP transports instead of replaying the rejected UDP ones (review SES-013; upstream main
+    // clears the same queue in close()).
+    pendingSetupRtpLoadInfos.clear();
     messageChannel.close();
   }
 
