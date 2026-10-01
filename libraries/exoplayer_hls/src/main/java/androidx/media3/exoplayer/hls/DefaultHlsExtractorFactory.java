@@ -78,10 +78,13 @@ public final class DefaultHlsExtractorFactory implements HlsExtractorFactory {
   /**
    * Equivalent to {@link #DefaultHlsExtractorFactory(int, boolean) new
    * DefaultHlsExtractorFactory(payloadReaderFactoryFlags = 0, exposeCea608WhenMissingDeclarations =
-   * true)}
+   * false)}. Unlike upstream, a CEA-608 track is not fabricated for playlists without Closed
+   * Captions declarations: live IPTV playlists rarely declare them, and the fabricated track shows
+   * up as a phantom subtitle track. Declared Closed Captions and PMT caption service descriptors
+   * are unaffected.
    */
   public DefaultHlsExtractorFactory() {
-    this(/* payloadReaderFactoryFlags= */ 0, /* exposeCea608WhenMissingDeclarations */ true);
+    this(/* payloadReaderFactoryFlags= */ 0, /* exposeCea608WhenMissingDeclarations */ false);
     codecsToParseWithinGopSampleDependencies = C.VIDEO_CODEC_FLAG_H264 | C.VIDEO_CODEC_FLAG_H265;
   }
 
