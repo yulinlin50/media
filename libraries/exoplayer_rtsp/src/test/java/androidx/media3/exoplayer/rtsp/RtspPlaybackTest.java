@@ -703,6 +703,23 @@ public final class RtspPlaybackTest {
     assertThat(protocolPhases(events)).contains("CLOCK_RANGE_UNCONFIRMED");
   }
 
+  /**
+   * 测试台 `/mp2t-noclock` 的实际响应形态（`npt=now-`）：同样必须报「未被确认」。
+   * `npt=now-` 能被 NPT 解析器正常接受（now → 0、无终止 → live），所以事件不会被
+   * ParserException 路径吞掉——这正是「静默忽略」与「硬失败」的区别所在。
+   */
+  @Test
+  public void playResponseWithNptNowRangeWhileClockRangeRequested_signalsUnconfirmedClockRange()
+      throws Exception {
+    FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
+    List<RtspProtocolEvent> events =
+        protocolEventsOfClockRangeReplay(
+            clockRangeResponseProvider(fakeRtpDataChannel, /* playResponseRange= */ "npt=now-"),
+            (trackId) -> fakeRtpDataChannel);
+
+    assertThat(protocolPhases(events)).contains("CLOCK_RANGE_UNCONFIRMED");
+  }
+
   /** clock= 回显（服务器确认了请求的窗口）：不得报「未被确认」。 */
   @Test
   public void playResponseEchoingClockRange_doesNotSignalUnconfirmedClockRange() throws Exception {
