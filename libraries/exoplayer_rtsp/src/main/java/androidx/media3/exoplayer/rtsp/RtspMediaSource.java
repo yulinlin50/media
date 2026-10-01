@@ -365,6 +365,31 @@ public final class RtspMediaSource extends BaseMediaSource {
         clockRangeOverride);
   }
 
+  @VisibleForTesting
+  /* package */ RtspMediaSource(
+      MediaItem mediaItem,
+      RtpDataChannel.Factory rtpDataChannelFactory,
+      String userAgent,
+      SocketFactory socketFactory,
+      boolean debugLoggingEnabled,
+      @Nullable Executor protocolEventExecutor,
+      @Nullable RtspProtocolEventListener protocolEventListener,
+      @Nullable String clockRangeOverride) {
+    this(
+        mediaItem,
+        rtpDataChannelFactory,
+        userAgent,
+        socketFactory,
+        debugLoggingEnabled,
+        /* credentials= */ null,
+        protocolEventExecutor,
+        protocolEventListener,
+        /* requestGeneration= */ 0,
+        /* attemptToken= */ 0,
+        /* controlRequestTimeoutMs= */ DEFAULT_CONTROL_REQUEST_TIMEOUT_MS,
+        clockRangeOverride);
+  }
+
   private RtspMediaSource(
       MediaItem mediaItem,
       RtpDataChannel.Factory rtpDataChannelFactory,

@@ -686,6 +686,112 @@ public final class RtspPlaybackTest {
     assertThat(player.getDuration()).isEqualTo(3_600_000);
     player.release();
   }
+
+  /**
+   * 服务器忽略 clock= 回看请求、显式回一个直播 npt 范围时，客户端必须把「回看窗口未被确认」
+   * 作为独立协议事件报出去（播放本身正常，200）：App 侧据此收走伪造的回看时间轴并转直播。
+   */
+  @Test
+  public void playResponseWithNptRangeWhileClockRangeRequested_signalsUnconfirmedClockRange()
+      throws Exception {
+    FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
+    List<RtspProtocolEvent> events =
+        protocolEventsOfClockRangeReplay(
+            clockRangeResponseProvider(fakeRtpDataChannel, /* playResponseRange= */ "npt=0.000-"),
+            (trackId) -> fakeRtpDataChannel);
+
+    assertThat(protocolPhases(events)).contains("CLOCK_RANGE_UNCONFIRMED");
+  }
+
+  /** clock= 回显（服务器确认了请求的窗口）：不得报「未被确认」。 */
+  @Test
+  public void playResponseEchoingClockRange_doesNotSignalUnconfirmedClockRange() throws Exception {
+    FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
+    List<RtspProtocolEvent> events =
+        protocolEventsOfClockRangeReplay(
+            clockRangeResponseProvider(
+                fakeRtpDataChannel, /* playResponseRange= */ "clock=20260930T120000Z-20260930T130000Z"),
+            (trackId) -> fakeRtpDataChannel);
+
+    assertThat(protocolPhases(events)).doesNotContain("CLOCK_RANGE_UNCONFIRMED");
+  }
+
+  /**
+   * 无 Range 头的 PLAY 响应（RFC2326 Section 12 允许省略）保持「不确定」：不能把不回显的合规
+   * 服务器误判成忽略了 clock=。
+   */
+  @Test
+  public void playResponseWithoutRangeWhileClockRangeRequested_doesNotSignalUnconfirmedClockRange()
+      throws Exception {
+    FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
+    List<RtspProtocolEvent> events =
+        protocolEventsOfClockRangeReplay(
+            clockRangeResponseProvider(fakeRtpDataChannel, /* playResponseRange= */ null),
+            (trackId) -> fakeRtpDataChannel);
+
+    assertThat(protocolPhases(events)).doesNotContain("CLOCK_RANGE_UNCONFIRMED");
+  }
+
+  /** clock= 回放会话的响应桩：可注入 PLAY 响应的 Range 头（null = 不带 Range）。 */
+  private ResponseProvider clockRangeResponseProvider(
+      FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel, @Nullable String playResponseRange) {
+    return new ResponseProvider(
+        clock,
+        ImmutableList.of(aacRtpPacketStreamDump),
+        fakeRtpDataChannel,
+        RtspMessageUtil.DEFAULT_RTSP_TIMEOUT_MS,
+        /* optionsRequestCounter= */ Optional.empty()) {
+      @Override
+      public RtspResponse getPlayResponse() {
+        RtspResponse response = super.getPlayResponse();
+        if (playResponseRange == null) {
+          return response;
+        }
+        return new RtspResponse(
+            response.status,
+            response.headers.buildUpon().add(RtspHeaders.RANGE, playResponseRange).build(),
+            response.messageBody);
+      }
+    };
+  }
+
+  /** 跑完一次 clock= 回放会话（DESCRIBE→SETUP→PLAY→READY）并返回期间派发的协议事件。 */
+  private List<RtspProtocolEvent> protocolEventsOfClockRangeReplay(
+      RtspServer.ResponseProvider responseProvider, RtpDataChannel.Factory rtpDataChannelFactory)
+      throws Exception {
+    rtspServer = new RtspServer(responseProvider);
+    ConcurrentLinkedQueue<RtspProtocolEvent> events = new ConcurrentLinkedQueue<>();
+    ExoPlayer player =
+        new ExoPlayer.Builder(applicationContext, capturingRenderersFactory)
+            .setClock(clock)
+            .build();
+    player.setMediaSource(
+        new RtspMediaSource(
+            MediaItem.fromUri(RtspTestUtils.getTestUri(rtspServer.startAndGetPortNumber())),
+            rtpDataChannelFactory,
+            "ExoPlayer:PlaybackTest",
+            SocketFactory.getDefault(),
+            /* debugLoggingEnabled= */ false,
+            /* protocolEventExecutor= */ Runnable::run,
+            events::add,
+            /* clockRangeOverride= */ "clock=20260930T120000Z-20260930T130000Z"),
+        false);
+
+    player.prepare();
+    player.play();
+    TestPlayerRunHelper.runUntilPlaybackState(player, Player.STATE_READY);
+    player.release();
+    return new ArrayList<>(events);
+  }
+
+  private static List<String> protocolPhases(List<RtspProtocolEvent> events) {
+    List<String> phases = new ArrayList<>();
+    for (RtspProtocolEvent event : events) {
+      phases.add(event.getPhase());
+    }
+    return phases;
+  }
+
   private List<RtspRequest> requestsOfMethod(int method) {
     List<RtspRequest> requests = new ArrayList<>();
     for (RtspRequest request : rtspServer.getReceivedRequests()) {

@@ -1086,6 +1086,25 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
                     : RtspSessionTiming.parsePlayResponseTiming(
                         startTimingString, clockRangeStartEpochMs, clockRangeEndEpochMs);
 
+            // A clock= replay request answered with an explicit non-clock range means the server
+            // ignored the requested window and started from live/now: the VOD-ified replay timeline
+            // is not backed by the stream, so the app must not keep presenting it as a replay.
+            // Emitted as its own phase (the response itself is a healthy 200). A response without a
+            // Range header stays inconclusive — RFC2326 Section 12 makes it optional, so an
+            // honoring-but-silent server must not be accused of ignoring the range.
+            if (clockRangeStartEpochMs != C.TIME_UNSET
+                && clockRangeEndEpochMs != C.TIME_UNSET
+                && startTimingString != null
+                && !startTimingString.trim().startsWith("clock")) {
+              emitProtocolEvent(
+                  RtspMessageUtil.toMethodString(METHOD_PLAY),
+                  response.status,
+                  "CLOCK_RANGE_UNCONFIRMED",
+                  /* failureReason= */ null,
+                  requestedTransport(matchingRequest),
+                  selectedTransport(response.headers));
+            }
+
             ImmutableList<RtspTrackTiming> trackTimingList;
             try {
               @Nullable String rtpInfoString = response.headers.get(RtspHeaders.RTP_INFO);
