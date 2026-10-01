@@ -152,6 +152,29 @@ import java.util.regex.Pattern;
   }
 
   /**
+   * Parses the Range header of a PLAY <b>response</b>. {@code npt=} ranges go through the regular
+   * parser; a {@code clock=} range is the server confirming the requested replay window and is
+   * VOD-ified into that window. With a malformed clock echo and a caller-provided override, the
+   * override window wins (the server did start playing); without an override the malformed header
+   * is a manifest error.
+   */
+  public static RtspSessionTiming parsePlayResponseTiming(
+      String rangeHeader, long overrideStartEpochMs, long overrideEndEpochMs)
+      throws ParserException {
+    Matcher matcher = CLOCK_RANGE_PATTERN.matcher(rangeHeader);
+    if (matcher.matches()) {
+      return forClockRange(
+          parseClockTimeMs(castNonNull(matcher.group(1))), parseClockTimeMs(castNonNull(matcher.group(2))));
+    }
+    if (rangeHeader.startsWith("clock")
+        && overrideStartEpochMs != C.TIME_UNSET
+        && overrideEndEpochMs != C.TIME_UNSET) {
+      return forClockRange(overrideStartEpochMs, overrideEndEpochMs);
+    }
+    return parseTiming(rangeHeader);
+  }
+
+  /**
    * Resolves the effective session timing of a DESCRIBE response. When a clock range override is
    * set and the SDP declares a live session, the timeline is VOD-ified into the override's seekable
    * replay window; otherwise the SDP timing wins.

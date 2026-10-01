@@ -640,6 +640,52 @@ public final class RtspPlaybackTest {
         .isEqualTo("clock=20260930T120000Z-20260930T130000Z");
     assertThat(playRequests.get(0).headers.get(RtspHeaders.SCALE)).isEqualTo("1.000000");
   }
+  @Test
+  public void playResponseEchoesClockRange_playStillSucceeds() throws Exception {
+    FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
+    RtpDataChannel.Factory rtpDataChannelFactory = (trackId) -> fakeRtpDataChannel;
+    ResponseProvider responseProvider =
+        new ResponseProvider(
+            clock,
+            ImmutableList.of(aacRtpPacketStreamDump),
+            fakeRtpDataChannel,
+            RtspMessageUtil.DEFAULT_RTSP_TIMEOUT_MS,
+            /* optionsRequestCounter= */ Optional.empty()) {
+          @Override
+          public RtspResponse getPlayResponse() {
+            RtspResponse response = super.getPlayResponse();
+            // 合规服务器会回显确认的回放窗口：PLAY 响应带 clock= Range
+            return new RtspResponse(
+                response.status,
+                response.headers.buildUpon()
+                    .add(RtspHeaders.RANGE, "clock=20260930T120000Z-20260930T130000Z")
+                    .build(),
+                response.messageBody);
+          }
+        };
+    rtspServer = new RtspServer(responseProvider);
+    ExoPlayer player =
+        new ExoPlayer.Builder(applicationContext, capturingRenderersFactory)
+            .setClock(clock)
+            .build();
+    player.setMediaSource(
+        new RtspMediaSource(
+            MediaItem.fromUri(RtspTestUtils.getTestUri(rtspServer.startAndGetPortNumber())),
+            rtpDataChannelFactory,
+            "ExoPlayer:PlaybackTest",
+            SocketFactory.getDefault(),
+            /* debugLoggingEnabled= */ false,
+            /* clockRangeOverride= */ "clock=20260930T120000Z-20260930T130000Z"),
+        false);
+
+    player.prepare();
+    player.play();
+    TestPlayerRunHelper.runUntilPlaybackState(player, Player.STATE_READY);
+    Timeline.Window window = player.getCurrentTimeline().getWindow(0, new Timeline.Window());
+    assertThat(window.isLive()).isFalse();
+    assertThat(player.getDuration()).isEqualTo(3_600_000);
+    player.release();
+  }
   private List<RtspRequest> requestsOfMethod(int method) {
     List<RtspRequest> requests = new ArrayList<>();
     for (RtspRequest request : rtspServer.getReceivedRequests()) {

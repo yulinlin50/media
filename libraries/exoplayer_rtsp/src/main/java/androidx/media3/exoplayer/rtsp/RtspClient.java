@@ -1076,12 +1076,15 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
             break;
 
           case METHOD_PLAY:
-            // Range header is optional for a PLAY response (RFC2326 Section 12).
+            // Range header is optional for a PLAY response (RFC2326 Section 12). A clock= echo
+            // (the server confirming the requested replay window) must not hit the npt-only
+            // parser: it VOD-ifies into the confirmed window instead of failing the response.
             @Nullable String startTimingString = response.headers.get(RtspHeaders.RANGE);
             RtspSessionTiming timing =
                 startTimingString == null
                     ? RtspSessionTiming.DEFAULT
-                    : RtspSessionTiming.parseTiming(startTimingString);
+                    : RtspSessionTiming.parsePlayResponseTiming(
+                        startTimingString, clockRangeStartEpochMs, clockRangeEndEpochMs);
 
             ImmutableList<RtspTrackTiming> trackTimingList;
             try {
