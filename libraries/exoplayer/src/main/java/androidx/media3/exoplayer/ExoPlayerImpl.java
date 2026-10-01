@@ -71,6 +71,7 @@ import androidx.media3.common.MediaItem;
 import androidx.media3.common.MediaLibraryInfo;
 import androidx.media3.common.MediaMetadata;
 import androidx.media3.common.Metadata;
+import androidx.media3.common.MimeTypes;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.PlaybackParameters;
 import androidx.media3.common.Player;
@@ -120,6 +121,7 @@ import androidx.media3.exoplayer.trackselection.TrackSelectionArray;
 import androidx.media3.exoplayer.trackselection.TrackSelector;
 import androidx.media3.exoplayer.trackselection.TrackSelectorResult;
 import androidx.media3.exoplayer.upstream.BandwidthMeter;
+import androidx.media3.exoplayer.video.MediaCodecVideoRenderer;
 import androidx.media3.exoplayer.video.VideoDecoderOutputBufferRenderer;
 import androidx.media3.exoplayer.video.VideoFrameMetadataListener;
 import androidx.media3.exoplayer.video.VideoRendererEventListener;
@@ -214,6 +216,11 @@ import java.util.function.IntConsumer;
   private MediaMetadata playlistMetadata;
   @Nullable private Format videoFormat;
   @Nullable private Format audioFormat;
+  private int initializedAudioTrackCount;
+  private int initializedAudioPassthroughTrackCount;
+  private int initializedAudioOffloadTrackCount;
+  private int initializedAudioTunnelingTrackCount;
+  private int initializedAudioUnsupportedFormatTrackCount;
   @Nullable private Object videoOutput;
   @Nullable private Surface ownedSurface;
   @Nullable private SurfaceHolder surfaceHolder;
@@ -1870,10 +1877,29 @@ import java.util.function.IntConsumer;
   }
 
   @Override
+  public @VideoEffectsSupport int getVideoEffectsSupport() {
+    verifyApplicationThread();
+    return getVideoEffectsSupport(renderers, playbackInfo.trackSelectorResult);
+  }
+
+  @Override
   @Nullable
   public Format getAudioFormat() {
     verifyApplicationThread();
     return audioFormat;
+  }
+
+  @Override
+  public @AudioProcessingSupport int getAudioProcessingSupport() {
+    verifyApplicationThread();
+    return getAudioProcessingSupportInternal();
+  }
+
+  @Override
+  public boolean isSkipSilenceSupported() {
+    verifyApplicationThread();
+    return getAudioProcessingSupportInternal() == AUDIO_PROCESSING_SUPPORTED
+        && initializedAudioTunnelingTrackCount == 0;
   }
 
   @Override
@@ -2089,6 +2115,78 @@ import java.util.function.IntConsumer;
       }
     }
     return false;
+  }
+
+  private static boolean isAudioPassthrough(AudioSink.AudioTrackConfig audioTrackConfig) {
+    return !audioTrackConfig.offload && !Util.isEncodingLinearPcm(audioTrackConfig.encoding);
+  }
+
+  private static boolean isAudioProcessingFormatUnsupported(
+      AudioSink.AudioTrackConfig audioTrackConfig) {
+    return !audioTrackConfig.offload
+        && Util.isEncodingLinearPcm(audioTrackConfig.encoding)
+        && audioTrackConfig.encoding != C.ENCODING_PCM_16BIT;
+  }
+
+  private @AudioProcessingSupport int getAudioProcessingSupportInternal() {
+    if (initializedAudioTrackCount == 0) {
+      return AUDIO_PROCESSING_UNAVAILABLE;
+    }
+    if (initializedAudioPassthroughTrackCount > 0) {
+      return AUDIO_PROCESSING_UNSUPPORTED_PASSTHROUGH;
+    }
+    if (initializedAudioOffloadTrackCount > 0) {
+      return AUDIO_PROCESSING_UNSUPPORTED_OFFLOAD;
+    }
+    return initializedAudioUnsupportedFormatTrackCount > 0
+        ? AUDIO_PROCESSING_UNSUPPORTED_FORMAT
+        : AUDIO_PROCESSING_SUPPORTED;
+  }
+
+  private void updateAudioTrackState(AudioSink.AudioTrackConfig audioTrackConfig, int delta) {
+    initializedAudioTrackCount = max(0, initializedAudioTrackCount + delta);
+    if (isAudioPassthrough(audioTrackConfig)) {
+      initializedAudioPassthroughTrackCount = max(0, initializedAudioPassthroughTrackCount + delta);
+    }
+    if (audioTrackConfig.offload) {
+      initializedAudioOffloadTrackCount = max(0, initializedAudioOffloadTrackCount + delta);
+    }
+    if (audioTrackConfig.tunneling) {
+      initializedAudioTunnelingTrackCount = max(0, initializedAudioTunnelingTrackCount + delta);
+    }
+    if (isAudioProcessingFormatUnsupported(audioTrackConfig)) {
+      initializedAudioUnsupportedFormatTrackCount =
+          max(0, initializedAudioUnsupportedFormatTrackCount + delta);
+    }
+  }
+
+  /* package */ static @VideoEffectsSupport int getVideoEffectsSupport(
+      Renderer[] renderers, TrackSelectorResult trackSelectorResult) {
+    for (int index = 0; index < trackSelectorResult.length; index++) {
+      @Nullable
+      RendererConfiguration configuration = trackSelectorResult.rendererConfigurations[index];
+      @Nullable ExoTrackSelection selection = trackSelectorResult.selections[index];
+      if (configuration == null || selection == null) {
+        continue;
+      }
+      Format format = selection.getSelectedFormat();
+      if (!MimeTypes.isVideo(format.sampleMimeType)) {
+        continue;
+      }
+      if (!(renderers[index] instanceof MediaCodecVideoRenderer)) {
+        return VIDEO_EFFECTS_UNSUPPORTED_RENDERER;
+      }
+      if (configuration.tunneling) {
+        return VIDEO_EFFECTS_UNSUPPORTED_TUNNELING;
+      }
+      if (format.drmInitData != null) {
+        return VIDEO_EFFECTS_UNSUPPORTED_DRM;
+      }
+      return MediaCodecVideoRenderer.isVideoEffectsFormatSupported(format)
+          ? VIDEO_EFFECTS_SUPPORTED
+          : VIDEO_EFFECTS_UNSUPPORTED_FORMAT;
+    }
+    return VIDEO_EFFECTS_UNAVAILABLE;
   }
 
   @Override
@@ -3498,11 +3596,13 @@ import java.util.function.IntConsumer;
 
     @Override
     public void onAudioTrackInitialized(AudioSink.AudioTrackConfig audioTrackConfig) {
+      updateAudioTrackState(audioTrackConfig, 1);
       analyticsCollector.onAudioTrackInitialized(audioTrackConfig);
     }
 
     @Override
     public void onAudioTrackReleased(AudioSink.AudioTrackConfig audioTrackConfig) {
+      updateAudioTrackState(audioTrackConfig, -1);
       analyticsCollector.onAudioTrackReleased(audioTrackConfig);
     }
 

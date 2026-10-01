@@ -706,10 +706,28 @@ public class SimpleExoPlayer extends BasePlayer implements ExoPlayer {
   }
 
   @Override
+  public @VideoEffectsSupport int getVideoEffectsSupport() {
+    blockUntilConstructorFinished();
+    return player.getVideoEffectsSupport();
+  }
+
+  @Override
   @Nullable
   public Format getAudioFormat() {
     blockUntilConstructorFinished();
     return player.getAudioFormat();
+  }
+
+  @Override
+  public @AudioProcessingSupport int getAudioProcessingSupport() {
+    blockUntilConstructorFinished();
+    return player.getAudioProcessingSupport();
+  }
+
+  @Override
+  public boolean isSkipSilenceSupported() {
+    blockUntilConstructorFinished();
+    return player.isSkipSilenceSupported();
   }
 
   @Override

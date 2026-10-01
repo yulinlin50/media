@@ -54,6 +54,7 @@ import androidx.annotation.CallSuper;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.media3.common.C;
+import androidx.media3.common.ColorInfo;
 import androidx.media3.common.DrmInitData;
 import androidx.media3.common.Effect;
 import androidx.media3.common.Format;
@@ -1554,6 +1555,13 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
         // Leave the default max input size.
         return Format.NO_VALUE;
     }
+  }
+
+  /** Returns whether video effects can be applied to {@code format}. */
+  public static boolean isVideoEffectsFormatSupported(Format format) {
+    return format.drmInitData == null
+        && !MimeTypes.VIDEO_DOLBY_VISION.equals(format.sampleMimeType)
+        && !ColorInfo.isTransferHdr(format.colorInfo);
   }
 
   @Override

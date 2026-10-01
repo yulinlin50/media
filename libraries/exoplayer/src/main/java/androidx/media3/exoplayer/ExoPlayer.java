@@ -20,6 +20,7 @@ import static androidx.media3.common.util.Util.isRunningOnEmulator;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
+import static java.lang.annotation.ElementType.TYPE_USE;
 
 import android.companion.virtual.VirtualDevice;
 import android.content.Context;
@@ -32,6 +33,7 @@ import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.TextureView;
+import androidx.annotation.IntDef;
 import androidx.annotation.IntRange;
 import androidx.annotation.Nullable;
 import androidx.annotation.RestrictTo;
@@ -80,6 +82,10 @@ import androidx.media3.extractor.ExtractorsFactory;
 import com.google.common.base.Function;
 import com.google.common.base.Supplier;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import java.lang.annotation.Documented;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
 import java.util.List;
 
 /**
@@ -166,6 +172,68 @@ import java.util.List;
  * </ul>
  */
 public interface ExoPlayer extends Player {
+
+  /** Support for processing the currently initialized audio output. */
+  @UnstableApi
+  @Documented
+  @Retention(RetentionPolicy.SOURCE)
+  @Target(TYPE_USE)
+  @IntDef({
+    AUDIO_PROCESSING_UNAVAILABLE,
+    AUDIO_PROCESSING_SUPPORTED,
+    AUDIO_PROCESSING_UNSUPPORTED_PASSTHROUGH,
+    AUDIO_PROCESSING_UNSUPPORTED_OFFLOAD,
+    AUDIO_PROCESSING_UNSUPPORTED_FORMAT
+  })
+  @interface AudioProcessingSupport {}
+
+  /** No audio output is currently initialized. */
+  @UnstableApi int AUDIO_PROCESSING_UNAVAILABLE = 0;
+
+  /** The configured audio processor chain is supported. */
+  @UnstableApi int AUDIO_PROCESSING_SUPPORTED = 1;
+
+  /** The audio output is using encoded passthrough. */
+  @UnstableApi int AUDIO_PROCESSING_UNSUPPORTED_PASSTHROUGH = 2;
+
+  /** The audio output is using offload playback. */
+  @UnstableApi int AUDIO_PROCESSING_UNSUPPORTED_OFFLOAD = 3;
+
+  /** The audio output format bypasses the configured audio processor chain. */
+  @UnstableApi int AUDIO_PROCESSING_UNSUPPORTED_FORMAT = 4;
+
+  /** Support for applying video effects to the currently selected video track. */
+  @UnstableApi
+  @Documented
+  @Retention(RetentionPolicy.SOURCE)
+  @Target(TYPE_USE)
+  @IntDef({
+    VIDEO_EFFECTS_UNAVAILABLE,
+    VIDEO_EFFECTS_SUPPORTED,
+    VIDEO_EFFECTS_UNSUPPORTED_RENDERER,
+    VIDEO_EFFECTS_UNSUPPORTED_TUNNELING,
+    VIDEO_EFFECTS_UNSUPPORTED_DRM,
+    VIDEO_EFFECTS_UNSUPPORTED_FORMAT
+  })
+  @interface VideoEffectsSupport {}
+
+  /** No video track is currently selected. */
+  @UnstableApi int VIDEO_EFFECTS_UNAVAILABLE = 0;
+
+  /** Video effects are supported. */
+  @UnstableApi int VIDEO_EFFECTS_SUPPORTED = 1;
+
+  /** The selected video renderer does not support video effects. */
+  @UnstableApi int VIDEO_EFFECTS_UNSUPPORTED_RENDERER = 2;
+
+  /** The selected video renderer is using tunneling. */
+  @UnstableApi int VIDEO_EFFECTS_UNSUPPORTED_TUNNELING = 3;
+
+  /** The selected video format uses DRM. */
+  @UnstableApi int VIDEO_EFFECTS_UNSUPPORTED_DRM = 4;
+
+  /** The selected video format does not support video effects. */
+  @UnstableApi int VIDEO_EFFECTS_UNSUPPORTED_FORMAT = 5;
 
   /** A listener for audio offload events. */
   @UnstableApi
@@ -2001,10 +2069,24 @@ public interface ExoPlayer extends Player {
   @Nullable
   Format getAudioFormat();
 
+  /** Returns audio processing support for the currently initialized audio output. */
+  @UnstableApi
+  @AudioProcessingSupport
+  int getAudioProcessingSupport();
+
+  /** Returns whether silence skipping is supported by the current audio output. */
+  @UnstableApi
+  boolean isSkipSilenceSupported();
+
   /** Returns the video format currently being played, or null if no video is being played. */
   @UnstableApi
   @Nullable
   Format getVideoFormat();
+
+  /** Returns video effect support for the currently selected renderer and format. */
+  @UnstableApi
+  @VideoEffectsSupport
+  int getVideoEffectsSupport();
 
   /** Returns {@link DecoderCounters} for audio, or null if no audio is being played. */
   @UnstableApi

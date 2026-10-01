@@ -393,9 +393,24 @@ public class StubExoPlayer extends StubPlayer implements ExoPlayer {
     throw new UnsupportedOperationException();
   }
 
+  @Override
+  public @ExoPlayer.AudioProcessingSupport int getAudioProcessingSupport() {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public boolean isSkipSilenceSupported() {
+    throw new UnsupportedOperationException();
+  }
+
   @Nullable
   @Override
   public Format getVideoFormat() {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public @ExoPlayer.VideoEffectsSupport int getVideoEffectsSupport() {
     throw new UnsupportedOperationException();
   }
 
