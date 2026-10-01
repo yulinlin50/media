@@ -22,13 +22,18 @@ import androidx.annotation.Nullable;
 import androidx.media3.common.C;
 import androidx.media3.common.ParserException;
 import androidx.media3.common.util.Util;
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
  * Represent the timing (RTSP Normal Playback Time format) of an RTSP session.
  *
- * <p>Currently only NPT is supported. See RFC2326 Section 3.6 for detail of NPT.
+ * <p>Currently NPT and absolute UTC clock ranges are supported. See RFC2326 Section 3.6.
  */
 /* package */ final class RtspSessionTiming {
   /** The default session timing starting from 0.000 and indefinite length, effectively live. */
@@ -40,6 +45,16 @@ import java.util.regex.Pattern;
   private static final Pattern NPT_RANGE_PATTERN =
       Pattern.compile("npt[:=]([.\\d]+|now)\\s?-\\s?([.\\d]+)?");
   private static final String START_TIMING_NTP_FORMAT = "npt=%.3f-";
+
+  // Clock range, RFC2326 Section 3.6: "clock=yyyyMMddTHHmmssZ-yyyyMMddTHHMMSSZ", UTC only. Both
+  // endpoints are mandatory: a replay window without an end cannot be mapped onto a seekable
+  // timeline.
+  private static final Pattern CLOCK_RANGE_PATTERN =
+      Pattern.compile("clock[:=](\\d{8}T\\d{6}Z)-(\\d{8}T\\d{6}Z)");
+  private static final String CLOCK_RANGE_HEADER_FORMAT = "clock=%s-%s";
+  // Strict 16-character UTC wall clock ("20260930T120000Z"); parsing is locale-independent.
+  private static final DateTimeFormatter CLOCK_TIME_FORMAT =
+      DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
 
   private static final long LIVE_START_TIME = 0;
 
@@ -77,6 +92,76 @@ import java.util.regex.Pattern;
   public static String getOffsetStartTimeTiming(long offsetStartTimeMs) {
     double offsetStartTimeSec = (double) offsetStartTimeMs / C.MILLIS_PER_SECOND;
     return Util.formatInvariant(START_TIMING_NTP_FORMAT, offsetStartTimeSec);
+  }
+
+  /**
+   * Parses a strict UTC clock time string ({@code yyyyMMddTHHmmssZ}, RFC2326 Section 3.6) into
+   * epoch milliseconds. Anything else (including non-UTC offsets, missing Z, or impossible dates)
+   * is rejected: callers build these strings themselves, so a malformed value is a bug.
+   */
+  public static long parseClockTimeMs(String clockTimeString) throws ParserException {
+    try {
+      return OffsetDateTime.parse(clockTimeString, CLOCK_TIME_FORMAT).toInstant().toEpochMilli();
+    } catch (DateTimeParseException e) {
+      throw ParserException.createForMalformedManifest(clockTimeString, e);
+    }
+  }
+
+  /** Formats epoch milliseconds as a strict UTC clock time string (RFC2326 Section 3.6). */
+  public static String formatClockTimeMs(long epochMs) {
+    return CLOCK_TIME_FORMAT.format(Instant.ofEpochMilli(epochMs));
+  }
+
+  /**
+   * Parses a clock range override ({@code clock=startTime-endTime} as it appears in a PLAY Range
+   * header) into {@code [startEpochMs, endEpochMs]}, or returns {@code null} for {@code null}.
+   *
+   * @throws IllegalArgumentException When the override is non-null but malformed or unordered: the
+   *     override is built by the caller, so a malformed value is a caller bug and must fail fast.
+   */
+  @Nullable
+  public static long[] parseClockRangeOverride(@Nullable String clockRangeOverride)
+      throws ParserException {
+    if (clockRangeOverride == null) {
+      return null;
+    }
+    Matcher matcher = CLOCK_RANGE_PATTERN.matcher(clockRangeOverride);
+    if (!matcher.matches()) {
+      throw ParserException.createForMalformedManifest(clockRangeOverride, /* cause= */ null);
+    }
+    long startEpochMs = parseClockTimeMs(castNonNull(matcher.group(1)));
+    long endEpochMs = parseClockTimeMs(castNonNull(matcher.group(2)));
+    if (endEpochMs < startEpochMs) {
+      throw ParserException.createForMalformedManifest(clockRangeOverride, /* cause= */ null);
+    }
+    return new long[] {startEpochMs, endEpochMs};
+  }
+
+  /** Formats a clock range override as it appears in a PLAY Range header. */
+  public static String formatClockRange(long startEpochMs, long endEpochMs) {
+    return Util.formatInvariant(
+        CLOCK_RANGE_HEADER_FORMAT, formatClockTimeMs(startEpochMs), formatClockTimeMs(endEpochMs));
+  }
+
+  /**
+   * Creates the VOD-like timing of a clock range: the session starts at 0 and lasts {@code
+   * endEpochMs - startEpochMs}, which makes the timeline seekable.
+   */
+  public static RtspSessionTiming forClockRange(long startEpochMs, long endEpochMs) {
+    return new RtspSessionTiming(/* startTimeMs= */ 0, endEpochMs - startEpochMs);
+  }
+
+  /**
+   * Resolves the effective session timing of a DESCRIBE response. When a clock range override is
+   * set and the SDP declares a live session, the timeline is VOD-ified into the override's seekable
+   * replay window; otherwise the SDP timing wins.
+   */
+  public static RtspSessionTiming resolveWithClockRangeOverride(
+      RtspSessionTiming sdpTiming, @Nullable long[] clockRangeOverrideEpochMs) {
+    if (clockRangeOverrideEpochMs == null || !sdpTiming.isLive()) {
+      return sdpTiming;
+    }
+    return forClockRange(clockRangeOverrideEpochMs[0], clockRangeOverrideEpochMs[1]);
   }
 
   /**

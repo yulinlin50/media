@@ -66,4 +66,103 @@ public class RtspSessionTimingTest {
   public void parseTiming_withInvalidRangeTiming_throwsParserException() {
     assertThrows(ParserException.class, () -> RtspSessionTiming.parseTiming("npt=10.000-2.054"));
   }
+
+  @Test
+  public void parseClockTimeMs_validUtcString() throws Exception {
+    long expected = java.time.Instant.parse("2026-09-30T12:00:00Z").toEpochMilli();
+    assertThat(RtspSessionTiming.parseClockTimeMs("20260930T120000Z")).isEqualTo(expected);
+  }
+
+  @Test
+  public void parseClockTimeMs_rejectsMissingZ() {
+    assertThrows(ParserException.class, () -> RtspSessionTiming.parseClockTimeMs("20260930T120000"));
+  }
+
+  @Test
+  public void parseClockTimeMs_rejectsShortString() {
+    assertThrows(ParserException.class, () -> RtspSessionTiming.parseClockTimeMs("2026093T12000Z"));
+  }
+
+  @Test
+  public void parseClockTimeMs_rejectsImpossibleDate() {
+    // Strict formatter: month 13 and hour 25 must not silently roll over.
+    assertThrows(
+        ParserException.class, () -> RtspSessionTiming.parseClockTimeMs("20261330T250000Z"));
+  }
+
+  @Test
+  public void formatClockTimeMs_roundTrip() throws Exception {
+    long epochMs = java.time.Instant.parse("2026-09-30T12:34:56Z").toEpochMilli();
+    assertThat(RtspSessionTiming.formatClockTimeMs(epochMs)).isEqualTo("20260930T123456Z");
+    assertThat(RtspSessionTiming.parseClockTimeMs("20260930T123456Z")).isEqualTo(epochMs);
+  }
+
+  @Test
+  public void parseClockRangeOverride_nullReturnsNull() throws Exception {
+    assertThat(RtspSessionTiming.parseClockRangeOverride(null)).isNull();
+  }
+
+  @Test
+  public void parseClockRangeOverride_validRange() throws Exception {
+    long[] range =
+        RtspSessionTiming.parseClockRangeOverride("clock=20260930T120000Z-20260930T130000Z");
+    assertThat(range).hasLength(2);
+    assertThat(range[0])
+        .isEqualTo(java.time.Instant.parse("2026-09-30T12:00:00Z").toEpochMilli());
+    assertThat(range[1])
+        .isEqualTo(java.time.Instant.parse("2026-09-30T13:00:00Z").toEpochMilli());
+  }
+
+  @Test
+  public void parseClockRangeOverride_malformedThrows() {
+    assertThrows(
+        ParserException.class,
+        () -> RtspSessionTiming.parseClockRangeOverride("clock=20260930T120000Z-"));
+    assertThrows(
+        ParserException.class, () -> RtspSessionTiming.parseClockRangeOverride("npt=0-3600"));
+  }
+
+  @Test
+  public void parseClockRangeOverride_endBeforeStartThrows() {
+    assertThrows(
+        ParserException.class,
+        () -> RtspSessionTiming.parseClockRangeOverride("clock=20260930T130000Z-20260930T120000Z"));
+  }
+
+  @Test
+  public void forClockRange_isVodWindowStartingAtZero() {
+    RtspSessionTiming timing =
+        RtspSessionTiming.forClockRange(
+            java.time.Instant.parse("2026-09-30T12:00:00Z").toEpochMilli(),
+            java.time.Instant.parse("2026-09-30T13:00:00Z").toEpochMilli());
+    assertThat(timing.isLive()).isFalse();
+    assertThat(timing.startTimeMs).isEqualTo(0);
+    assertThat(timing.getDurationMs()).isEqualTo(3_600_000);
+  }
+
+  @Test
+  public void resolveWithClockRangeOverride_liveSdpVodifies() {
+    long start = java.time.Instant.parse("2026-09-30T12:00:00Z").toEpochMilli();
+    long end = java.time.Instant.parse("2026-09-30T13:00:00Z").toEpochMilli();
+    RtspSessionTiming resolved =
+        RtspSessionTiming.resolveWithClockRangeOverride(
+            RtspSessionTiming.DEFAULT, new long[] {start, end});
+    assertThat(resolved.isLive()).isFalse();
+    assertThat(resolved.getDurationMs()).isEqualTo(3_600_000);
+  }
+
+  @Test
+  public void resolveWithClockRangeOverride_withoutOverrideKeepsSdpTiming() {
+    RtspSessionTiming resolved =
+        RtspSessionTiming.resolveWithClockRangeOverride(RtspSessionTiming.DEFAULT, null);
+    assertThat(resolved.isLive()).isTrue();
+  }
+
+  @Test
+  public void resolveWithClockRangeOverride_vodSdpKeepsOwnTiming() throws Exception {
+    RtspSessionTiming sdpTiming = RtspSessionTiming.parseTiming("npt=0-50.46");
+    RtspSessionTiming resolved =
+        RtspSessionTiming.resolveWithClockRangeOverride(sdpTiming, new long[] {0, 3_600_000});
+    assertThat(resolved.getDurationMs()).isEqualTo(50_460);
+  }
 }

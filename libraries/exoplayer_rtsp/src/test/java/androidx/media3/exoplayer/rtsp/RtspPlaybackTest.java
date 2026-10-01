@@ -34,6 +34,7 @@ import androidx.annotation.Nullable;
 import androidx.media3.common.C;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
+import androidx.media3.common.Timeline;
 import androidx.media3.common.Player;
 import androidx.media3.common.Player.Listener;
 import androidx.media3.common.util.Clock;
@@ -595,6 +596,50 @@ public final class RtspPlaybackTest {
     verify(listener, never()).onIsLoadingChanged(true);
   }
 
+  @Test
+  public void prepare_withClockRangeOverride_playCarriesClockRangeAndVodifiesTimeline()
+      throws Exception {
+    FakeUdpDataSourceRtpDataChannel fakeRtpDataChannel = new FakeUdpDataSourceRtpDataChannel();
+    RtpDataChannel.Factory rtpDataChannelFactory = (trackId) -> fakeRtpDataChannel;
+    ResponseProvider responseProvider =
+        new ResponseProvider(
+            clock,
+            ImmutableList.of(aacRtpPacketStreamDump),
+            fakeRtpDataChannel,
+            RtspMessageUtil.DEFAULT_RTSP_TIMEOUT_MS,
+            /* optionsRequestCounter= */ Optional.empty());
+    rtspServer = new RtspServer(responseProvider);
+    ExoPlayer player =
+        new ExoPlayer.Builder(applicationContext, capturingRenderersFactory)
+            .setClock(clock)
+            .build();
+    player.setMediaSource(
+        new RtspMediaSource(
+            MediaItem.fromUri(RtspTestUtils.getTestUri(rtspServer.startAndGetPortNumber())),
+            rtpDataChannelFactory,
+            "ExoPlayer:PlaybackTest",
+            SocketFactory.getDefault(),
+            /* debugLoggingEnabled= */ false,
+            /* clockRangeOverride= */ "clock=20260930T120000Z-20260930T130000Z"),
+        false);
+
+    player.prepare();
+    player.play();
+    TestPlayerRunHelper.runUntilPlaybackState(player, Player.STATE_READY);
+    // A live SDP with a clock override must present a fixed-duration, seekable replay window.
+    Timeline.Window window = player.getCurrentTimeline().getWindow(0, new Timeline.Window());
+    assertThat(window.isLive()).isFalse();
+    assertThat(player.getDuration()).isEqualTo(3_600_000);
+    player.release();
+
+    // PLAY carries the absolute UTC clock range (offset 0 keeps the window start) plus a fixed
+    // scale, instead of the live npt= range.
+    List<RtspRequest> playRequests = requestsOfMethod(METHOD_PLAY);
+    assertThat(playRequests).hasSize(1);
+    assertThat(playRequests.get(0).headers.get(RtspHeaders.RANGE))
+        .isEqualTo("clock=20260930T120000Z-20260930T130000Z");
+    assertThat(playRequests.get(0).headers.get(RtspHeaders.SCALE)).isEqualTo("1.000000");
+  }
   private List<RtspRequest> requestsOfMethod(int method) {
     List<RtspRequest> requests = new ArrayList<>();
     for (RtspRequest request : rtspServer.getReceivedRequests()) {

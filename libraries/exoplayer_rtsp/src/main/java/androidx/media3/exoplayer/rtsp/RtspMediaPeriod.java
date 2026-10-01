@@ -153,6 +153,38 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       long requestGeneration,
       long attemptToken,
       long controlRequestTimeoutMs) {
+    this(
+        allocator,
+        rtpDataChannelFactory,
+        uri,
+        listener,
+        userAgent,
+        socketFactory,
+        debugLoggingEnabled,
+        credentials,
+        protocolEventExecutor,
+        protocolEventListener,
+        requestGeneration,
+        attemptToken,
+        controlRequestTimeoutMs,
+        /* clockRangeOverride= */ null);
+  }
+
+  RtspMediaPeriod(
+      Allocator allocator,
+      RtpDataChannel.Factory rtpDataChannelFactory,
+      Uri uri,
+      Listener listener,
+      String userAgent,
+      SocketFactory socketFactory,
+      boolean debugLoggingEnabled,
+      @Nullable RtspMessageUtil.RtspAuthUserInfo credentials,
+      @Nullable Executor protocolEventExecutor,
+      @Nullable RtspProtocolEventListener protocolEventListener,
+      long requestGeneration,
+      long attemptToken,
+      long controlRequestTimeoutMs,
+      @Nullable String clockRangeOverride) {
     this.allocator = allocator;
     this.rtpDataChannelFactory = rtpDataChannelFactory;
     this.listener = listener;
@@ -172,7 +204,8 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
             protocolEventListener,
             requestGeneration,
             attemptToken,
-            controlRequestTimeoutMs);
+            controlRequestTimeoutMs,
+            clockRangeOverride);
     rtspLoaderWrappers = new ArrayList<>();
     selectedLoadInfos = new ArrayList<>();
     extraQueuesLock = new Object();

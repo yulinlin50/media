@@ -82,6 +82,7 @@ public final class RtspMediaSource extends BaseMediaSource {
     @Nullable private String credentialPassword;
     @Nullable private Executor protocolEventExecutor;
     @Nullable private RtspProtocolEventListener protocolEventListener;
+    @Nullable private String clockRangeOverride;
     private long requestGeneration;
     private long attemptToken;
 
@@ -161,6 +162,24 @@ public final class RtspMediaSource extends BaseMediaSource {
     @CanIgnoreReturnValue
     public Factory setDebugLoggingEnabled(boolean debugLoggingEnabled) {
       this.debugLoggingEnabled = debugLoggingEnabled;
+      return this;
+    }
+
+    /**
+     * Sets an optional clock range override ({@code clock=yyyyMMddTHHmmssZ-yyyyMMddTHHmmssZ}, as it
+     * appears in a PLAY Range header) for replay sessions on live servers: when the SDP declares a
+     * live session, the timeline is VOD-ified into this seekable window and PLAY requests carry
+     * {@code Range: clock=...} instead of {@code npt=}. See RFC2326 Section 3.6.
+     *
+     * <p>The default value is {@code null} (no override; the session plays live with {@code npt=}
+     * ranges).
+     *
+     * @param clockRangeOverride The clock range override string, or {@code null} to play live.
+     * @return This Factory, for convenience.
+     */
+    @CanIgnoreReturnValue
+    public Factory setClockRangeOverride(@Nullable String clockRangeOverride) {
+      this.clockRangeOverride = clockRangeOverride;
       return this;
     }
 
@@ -253,7 +272,8 @@ public final class RtspMediaSource extends BaseMediaSource {
           protocolEventListener,
           requestGeneration,
           attemptToken,
-          controlRequestTimeoutMs);
+          controlRequestTimeoutMs,
+          clockRangeOverride);
     }
 
     private boolean shouldForceUseRtpTcp(MediaItem mediaItem) {
@@ -296,6 +316,7 @@ public final class RtspMediaSource extends BaseMediaSource {
   private final long requestGeneration;
   private final long attemptToken;
   private final long controlRequestTimeoutMs;
+  @Nullable private final String clockRangeOverride;
 
   private long timelineDurationUs;
   private boolean timelineIsSeekable;
@@ -318,12 +339,30 @@ public final class RtspMediaSource extends BaseMediaSource {
         userAgent,
         socketFactory,
         debugLoggingEnabled,
+        /* clockRangeOverride= */ null);
+  }
+
+  @VisibleForTesting
+  /* package */ RtspMediaSource(
+      MediaItem mediaItem,
+      RtpDataChannel.Factory rtpDataChannelFactory,
+      String userAgent,
+      SocketFactory socketFactory,
+      boolean debugLoggingEnabled,
+      @Nullable String clockRangeOverride) {
+    this(
+        mediaItem,
+        rtpDataChannelFactory,
+        userAgent,
+        socketFactory,
+        debugLoggingEnabled,
         /* credentials= */ null,
         /* protocolEventExecutor= */ null,
         /* protocolEventListener= */ null,
         /* requestGeneration= */ 0,
         /* attemptToken= */ 0,
-        /* controlRequestTimeoutMs= */ DEFAULT_CONTROL_REQUEST_TIMEOUT_MS);
+        /* controlRequestTimeoutMs= */ DEFAULT_CONTROL_REQUEST_TIMEOUT_MS,
+        clockRangeOverride);
   }
 
   private RtspMediaSource(
@@ -337,7 +376,8 @@ public final class RtspMediaSource extends BaseMediaSource {
       @Nullable RtspProtocolEventListener protocolEventListener,
       long requestGeneration,
       long attemptToken,
-      long controlRequestTimeoutMs) {
+      long controlRequestTimeoutMs,
+      @Nullable String clockRangeOverride) {
     this.mediaItem = sanitizeMediaItem(mediaItem);
     this.rtpDataChannelFactory = rtpDataChannelFactory;
     this.userAgent = userAgent;
@@ -350,6 +390,7 @@ public final class RtspMediaSource extends BaseMediaSource {
     this.requestGeneration = requestGeneration;
     this.attemptToken = attemptToken;
     this.controlRequestTimeoutMs = controlRequestTimeoutMs;
+    this.clockRangeOverride = clockRangeOverride;
     this.timelineDurationUs = C.TIME_UNSET;
     this.timelineIsPlaceholder = true;
   }
@@ -416,7 +457,8 @@ public final class RtspMediaSource extends BaseMediaSource {
         protocolEventListener,
         requestGeneration,
         attemptToken,
-        controlRequestTimeoutMs);
+        controlRequestTimeoutMs,
+        clockRangeOverride);
   }
 
   @Override

@@ -173,6 +173,12 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
   private long pendingSeekPositionUs;
   /** Combined count of 3xx and SMIL redirection hops followed for the current DESCRIBE chain. */
   private int redirectCount;
+  /**
+   * The epoch millisecond start/end of the clock range override, or {@link C#TIME_UNSET} when
+   * playing live without an override (see the {@code clockRangeOverride} constructor parameter).
+   */
+  private final long clockRangeStartEpochMs;
+  private final long clockRangeEndEpochMs;
 
   /**
    * Creates a new instance.
@@ -226,6 +232,46 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
       long requestGeneration,
       long attemptToken,
       long controlRequestTimeoutMs) {
+    this(
+        sessionInfoListener,
+        playbackEventListener,
+        userAgent,
+        uri,
+        socketFactory,
+        debugLoggingEnabled,
+        credentials,
+        protocolEventExecutor,
+        protocolEventListener,
+        requestGeneration,
+        attemptToken,
+        controlRequestTimeoutMs,
+        /* clockRangeOverride= */ null);
+  }
+
+  /**
+   * Creates a client with credentials, redacted protocol-event delivery, and an optional clock
+   * range override for replay sessions on live servers.
+   *
+   * @param clockRangeOverride A {@code clock=startTime-endTime} range string (RFC2326 Section 3.6),
+   *     or {@code null} to play live. When set and the SDP declares a live session, the timeline is
+   *     VOD-ified into this seekable window and PLAY requests carry {@code Range: clock=...}.
+   * @throws IllegalArgumentException When {@code clockRangeOverride} is non-null but malformed: the
+   *     override is built by the caller, so a malformed value is a caller bug and must fail fast.
+   */
+  public RtspClient(
+      SessionInfoListener sessionInfoListener,
+      PlaybackEventListener playbackEventListener,
+      String userAgent,
+      Uri uri,
+      SocketFactory socketFactory,
+      boolean debugLoggingEnabled,
+      @Nullable RtspAuthUserInfo credentials,
+      @Nullable Executor protocolEventExecutor,
+      @Nullable RtspProtocolEventListener protocolEventListener,
+      long requestGeneration,
+      long attemptToken,
+      long controlRequestTimeoutMs,
+      @Nullable String clockRangeOverride) {
     checkArgument((protocolEventExecutor == null) == (protocolEventListener == null));
     this.sessionInfoListener = sessionInfoListener;
     this.playbackEventListener = playbackEventListener;
@@ -247,6 +293,14 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
     this.requestGeneration = requestGeneration;
     this.attemptToken = attemptToken;
     this.controlRequestTimeoutMs = Math.max(0, controlRequestTimeoutMs);
+    try {
+      @Nullable long[] clockRangeEpochMs = RtspSessionTiming.parseClockRangeOverride(clockRangeOverride);
+      this.clockRangeStartEpochMs =
+          clockRangeEpochMs == null ? C.TIME_UNSET : clockRangeEpochMs[0];
+      this.clockRangeEndEpochMs = clockRangeEpochMs == null ? C.TIME_UNSET : clockRangeEpochMs[1];
+    } catch (ParserException e) {
+      throw new IllegalArgumentException("Malformed clock range override", e);
+    }
     this.pendingSeekPositionUs = C.TIME_UNSET;
     this.rtspState = RTSP_STATE_UNINITIALIZED;
     this.protocolEventSequence = 0;
@@ -559,13 +613,29 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
     public void sendPlayRequest(Uri uri, long offsetMs, @Nullable String sessionId) {
       checkState(rtspState == RTSP_STATE_READY || rtspState == RTSP_STATE_PLAYING);
-      sendRequest(
-          getRequestWithCommonHeaders(
-              METHOD_PLAY,
-              sessionId,
-              /* additionalHeaders= */ ImmutableMap.of(
-                  RtspHeaders.RANGE, RtspSessionTiming.getOffsetStartTimeTiming(offsetMs)),
-              uri));
+      if (clockRangeStartEpochMs != C.TIME_UNSET && clockRangeEndEpochMs != C.TIME_UNSET) {
+        // Replay session on a live server: PLAY carries an absolute UTC clock range shifted by the
+        // in-window seek offset, with a fixed scale. The server streams the archive from that wall
+        // clock position; the client timeline was VOD-ified at DESCRIBE time.
+        String clockRangeHeader =
+            RtspSessionTiming.formatClockRange(
+                clockRangeStartEpochMs + offsetMs, clockRangeEndEpochMs);
+        sendRequest(
+            getRequestWithCommonHeaders(
+                METHOD_PLAY,
+                sessionId,
+                /* additionalHeaders= */ ImmutableMap.of(
+                    RtspHeaders.RANGE, clockRangeHeader, RtspHeaders.SCALE, "1.000000"),
+                uri));
+      } else {
+        sendRequest(
+            getRequestWithCommonHeaders(
+                METHOD_PLAY,
+                sessionId,
+                /* additionalHeaders= */ ImmutableMap.of(
+                    RtspHeaders.RANGE, RtspSessionTiming.getOffsetStartTimeTiming(offsetMs)),
+                uri));
+      }
     }
 
     public void sendTeardownRequest(Uri uri, @Nullable String sessionId) {
@@ -1076,6 +1146,15 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
           sessionInfoListener.onSessionTimelineRequestFailed("SDP format error.", /* cause= */ e);
           return;
         }
+      }
+
+      if (clockRangeStartEpochMs != C.TIME_UNSET && clockRangeEndEpochMs != C.TIME_UNSET) {
+        // Replay override: a live SDP is VOD-ified into the override's seekable window (a SDP that
+        // already declares a VOD range keeps its own timing).
+        sessionTiming =
+            RtspSessionTiming.resolveWithClockRangeOverride(
+                sessionTiming,
+                new long[] {clockRangeStartEpochMs, clockRangeEndEpochMs});
       }
 
       ImmutableList<RtspMediaTrack> tracks = buildTrackList(response, uri);
