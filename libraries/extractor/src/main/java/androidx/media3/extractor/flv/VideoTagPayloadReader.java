@@ -22,21 +22,29 @@ import androidx.media3.common.ParserException;
 import androidx.media3.common.util.ParsableByteArray;
 import androidx.media3.container.NalUnitUtil;
 import androidx.media3.extractor.AvcConfig;
+import androidx.media3.extractor.HevcConfig;
 import androidx.media3.extractor.TrackOutput;
+import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 
 /** Parses video tags from an FLV stream and extracts H.264 nal units. */
 /* package */ final class VideoTagPayloadReader extends TagPayloadReader {
 
   // Video codec.
   private static final int VIDEO_CODEC_AVC = 7;
+  private static final int VIDEO_CODEC_HEVC = 12;
 
   // Frame types.
   private static final int VIDEO_FRAME_KEYFRAME = 1;
   private static final int VIDEO_FRAME_VIDEO_INFO = 5;
 
-  // Packet types.
-  private static final int AVC_PACKET_TYPE_SEQUENCE_HEADER = 0;
-  private static final int AVC_PACKET_TYPE_AVC_NALU = 1;
+  // Packet types, shared by legacy and enhanced video tags.
+  private static final int PACKET_TYPE_SEQUENCE_START = 0;
+  private static final int PACKET_TYPE_CODED_FRAMES = 1;
+  private static final int PACKET_TYPE_SEQUENCE_END = 2;
+  private static final int PACKET_TYPE_CODED_FRAMES_X = 3;
+
+  // FourCC of the supported enhanced FLV video codec ('hvc1' = HEVC).
+  private static final int FOURCC_HVC1 = 0x68766331;
 
   // Temporary arrays.
   private final ParsableByteArray nalStartCode;
@@ -46,7 +54,12 @@ import androidx.media3.extractor.TrackOutput;
   // State variables.
   private boolean hasOutputFormat;
   private boolean hasOutputKeyframe;
+  private @MonotonicNonNull Format format;
+  private @MonotonicNonNull Format pendingFormat;
   private int frameType;
+  private int videoCodec;
+  private boolean enhancedVideo;
+  private int packetType;
 
   /**
    * @param output A {@link TrackOutput} to which samples should be written.
@@ -64,47 +77,71 @@ import androidx.media3.extractor.TrackOutput;
 
   @Override
   protected boolean parseHeader(ParsableByteArray data) throws UnsupportedFormatException {
-    int header = data.readUnsignedByte();
-    int frameType = (header >> 4) & 0x0F;
-    int videoCodec = (header & 0x0F);
-    // Support just H.264 encoded content.
-    if (videoCodec != VIDEO_CODEC_AVC) {
-      throw new UnsupportedFormatException("Video format not supported: " + videoCodec);
+    int firstByte = data.readUnsignedByte();
+    // Enhanced FLV (veovera enhanced RTMP v1): bit 7 marks an extended header, in which the
+    // low nibble is a packet type and a big-endian FourCC selects the codec. Legacy tags keep
+    // the codec id in the low nibble and the frame type in bits 4 to 6.
+    enhancedVideo = (firstByte & 0x80) != 0;
+    frameType = (firstByte >> 4) & 0x07;
+    if (enhancedVideo) {
+      packetType = firstByte & 0x0F;
+      if (data.bytesLeft() < 4) {
+        throw new UnsupportedFormatException("Truncated enhanced FLV video header");
+      }
+      int fourCc = (int) data.readUnsignedInt();
+      if (fourCc != FOURCC_HVC1) {
+        throw new UnsupportedFormatException(
+            "Enhanced FLV video format not supported: 0x" + String.format("%08X", fourCc));
+      }
+      videoCodec = VIDEO_CODEC_HEVC;
+    } else {
+      videoCodec = firstByte & 0x0F;
+      if (videoCodec != VIDEO_CODEC_AVC && videoCodec != VIDEO_CODEC_HEVC) {
+        throw new UnsupportedFormatException("Video format not supported: " + videoCodec);
+      }
+      packetType = C.INDEX_UNSET; // Read from the payload for legacy tags.
     }
-    this.frameType = frameType;
     return (frameType != VIDEO_FRAME_VIDEO_INFO);
   }
 
   @Override
   protected boolean parsePayload(ParsableByteArray data, long timeUs) throws ParserException {
-    int packetType = data.readUnsignedByte();
-    int compositionTimeMs = data.readInt24();
+    int type;
+    int compositionTimeMs;
+    if (enhancedVideo) {
+      type = packetType;
+      // CodedFrames carries a signed 24-bit composition time offset; CodedFramesX omits it.
+      compositionTimeMs = type == PACKET_TYPE_CODED_FRAMES ? data.readInt24() : 0;
+    } else {
+      type = data.readUnsignedByte();
+      compositionTimeMs = data.readInt24();
+    }
 
     timeUs += compositionTimeMs * 1000L;
-    // Parse avc sequence header in case this was not done before.
-    if (packetType == AVC_PACKET_TYPE_SEQUENCE_HEADER && !hasOutputFormat) {
+    // Parse sequence headers in case this was not done before, or in case the stream updates them.
+    if (type == PACKET_TYPE_SEQUENCE_START) {
       ParsableByteArray videoSequence = new ParsableByteArray(new byte[data.bytesLeft()]);
       data.readBytes(videoSequence.getData(), 0, data.bytesLeft());
-      AvcConfig avcConfig = AvcConfig.parse(videoSequence);
-      nalUnitLengthFieldLength = avcConfig.nalUnitLengthFieldLength;
-      // Construct and output the format.
-      Format format =
-          new Format.Builder()
-              .setContainerMimeType(MimeTypes.VIDEO_FLV)
-              .setSampleMimeType(MimeTypes.VIDEO_H264)
-              .setCodecs(avcConfig.codecs)
-              .setWidth(avcConfig.width)
-              .setHeight(avcConfig.height)
-              .setPixelWidthHeightRatio(avcConfig.pixelWidthHeightRatio)
-              .setInitializationData(avcConfig.initializationData)
-              .build();
-      output.format(format);
-      hasOutputFormat = true;
+      Format newFormat =
+          videoCodec == VIDEO_CODEC_AVC
+              ? parseAvcFormat(videoSequence)
+              : parseHevcFormat(videoSequence);
+      if (!newFormat.equals(format)) {
+        pendingFormat = newFormat;
+      }
+      hasOutputKeyframe = false;
       return false;
-    } else if (packetType == AVC_PACKET_TYPE_AVC_NALU && hasOutputFormat) {
+    } else if ((type == PACKET_TYPE_CODED_FRAMES || type == PACKET_TYPE_CODED_FRAMES_X)
+        && (hasOutputFormat || pendingFormat != null)) {
       boolean isKeyframe = frameType == VIDEO_FRAME_KEYFRAME;
       if (!hasOutputKeyframe && !isKeyframe) {
         return false;
+      }
+      if (pendingFormat != null) {
+        format = pendingFormat;
+        pendingFormat = null;
+        output.format(format);
+        hasOutputFormat = true;
       }
       // TODO: Deduplicate with Mp4Extractor.
       // Zero the top three bytes of the array that we'll use to decode nal unit lengths, in case
@@ -124,6 +161,9 @@ import androidx.media3.extractor.TrackOutput;
         data.readBytes(nalLength.getData(), nalUnitLengthFieldLengthDiff, nalUnitLengthFieldLength);
         nalLength.setPosition(0);
         bytesToWrite = nalLength.readUnsignedIntToInt();
+        if (bytesToWrite == 0) {
+          continue;
+        }
 
         // Write a start code for the current NAL unit.
         nalStartCode.setPosition(0);
@@ -141,5 +181,33 @@ import androidx.media3.extractor.TrackOutput;
     } else {
       return false;
     }
+  }
+
+  private Format parseAvcFormat(ParsableByteArray videoSequence) throws ParserException {
+    AvcConfig avcConfig = AvcConfig.parse(videoSequence);
+    nalUnitLengthFieldLength = avcConfig.nalUnitLengthFieldLength;
+    return new Format.Builder()
+        .setContainerMimeType(MimeTypes.VIDEO_FLV)
+        .setSampleMimeType(MimeTypes.VIDEO_H264)
+        .setCodecs(avcConfig.codecs)
+        .setWidth(avcConfig.width)
+        .setHeight(avcConfig.height)
+        .setPixelWidthHeightRatio(avcConfig.pixelWidthHeightRatio)
+        .setInitializationData(avcConfig.initializationData)
+        .build();
+  }
+
+  private Format parseHevcFormat(ParsableByteArray videoSequence) throws ParserException {
+    HevcConfig hevcConfig = HevcConfig.parse(videoSequence);
+    nalUnitLengthFieldLength = hevcConfig.nalUnitLengthFieldLength;
+    return new Format.Builder()
+        .setContainerMimeType(MimeTypes.VIDEO_FLV)
+        .setSampleMimeType(MimeTypes.VIDEO_H265)
+        .setCodecs(hevcConfig.codecs)
+        .setWidth(hevcConfig.width)
+        .setHeight(hevcConfig.height)
+        .setPixelWidthHeightRatio(hevcConfig.pixelWidthHeightRatio)
+        .setInitializationData(hevcConfig.initializationData)
+        .build();
   }
 }
