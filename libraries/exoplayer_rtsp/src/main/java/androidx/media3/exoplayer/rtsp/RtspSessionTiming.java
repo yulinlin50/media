@@ -33,7 +33,7 @@ import java.util.regex.Pattern;
 /**
  * Represent the timing (RTSP Normal Playback Time format) of an RTSP session.
  *
- * <p>Currently NPT and absolute UTC clock ranges are supported. See RFC2326 Section 3.6.
+ * <p>Currently NPT and absolute UTC clock ranges are supported. See RFC2326 Sections 3.6 and 3.7.
  */
 /* package */ final class RtspSessionTiming {
   /** The default session timing starting from 0.000 and indefinite length, effectively live. */
@@ -46,7 +46,7 @@ import java.util.regex.Pattern;
       Pattern.compile("npt[:=]([.\\d]+|now)\\s?-\\s?([.\\d]+)?");
   private static final String START_TIMING_NTP_FORMAT = "npt=%.3f-";
 
-  // Clock range, RFC2326 Section 3.6: "clock=yyyyMMddTHHmmssZ-yyyyMMddTHHMMSSZ", UTC only. Both
+  // Clock range, RFC2326 Section 3.7: "clock=yyyyMMddTHHmmssZ-yyyyMMddTHHMMSSZ", UTC only. Both
   // endpoints are mandatory: a replay window without an end cannot be mapped onto a seekable
   // timeline.
   private static final Pattern CLOCK_RANGE_PATTERN =
@@ -95,7 +95,7 @@ import java.util.regex.Pattern;
   }
 
   /**
-   * Parses a strict UTC clock time string ({@code yyyyMMddTHHmmssZ}, RFC2326 Section 3.6) into
+   * Parses a strict UTC clock time string ({@code yyyyMMddTHHmmssZ}, RFC2326 Section 3.7) into
    * epoch milliseconds. Anything else (including non-UTC offsets, missing Z, or impossible dates)
    * is rejected: callers build these strings themselves, so a malformed value is a bug.
    */
@@ -107,7 +107,7 @@ import java.util.regex.Pattern;
     }
   }
 
-  /** Formats epoch milliseconds as a strict UTC clock time string (RFC2326 Section 3.6). */
+  /** Formats epoch milliseconds as a strict UTC clock time string (RFC2326 Section 3.7). */
   public static String formatClockTimeMs(long epochMs) {
     return CLOCK_TIME_FORMAT.format(Instant.ofEpochMilli(epochMs));
   }

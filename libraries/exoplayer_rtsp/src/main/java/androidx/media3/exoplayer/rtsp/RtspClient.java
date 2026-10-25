@@ -252,7 +252,7 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
    * Creates a client with credentials, redacted protocol-event delivery, and an optional clock
    * range override for replay sessions on live servers.
    *
-   * @param clockRangeOverride A {@code clock=startTime-endTime} range string (RFC2326 Section 3.6),
+   * @param clockRangeOverride A {@code clock=startTime-endTime} range string (RFC2326 Section 3.7),
    *     or {@code null} to play live. When set and the SDP declares a live session, the timeline is
    *     VOD-ified into this seekable window and PLAY requests carry {@code Range: clock=...}.
    * @throws IllegalArgumentException When {@code clockRangeOverride} is non-null but malformed: the

@@ -169,7 +169,7 @@ public final class RtspMediaSource extends BaseMediaSource {
      * Sets an optional clock range override ({@code clock=yyyyMMddTHHmmssZ-yyyyMMddTHHmmssZ}, as it
      * appears in a PLAY Range header) for replay sessions on live servers: when the SDP declares a
      * live session, the timeline is VOD-ified into this seekable window and PLAY requests carry
-     * {@code Range: clock=...} instead of {@code npt=}. See RFC2326 Section 3.6.
+     * {@code Range: clock=...} instead of {@code npt=}. See RFC2326 Section 3.7.
      *
      * <p>The default value is {@code null} (no override; the session plays live with {@code npt=}
      * ranges).
