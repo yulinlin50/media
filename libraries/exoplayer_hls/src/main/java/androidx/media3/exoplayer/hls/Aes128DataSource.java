@@ -32,8 +32,10 @@ import java.security.NoSuchAlgorithmException;
 import java.security.spec.AlgorithmParameterSpec;
 import java.util.List;
 import java.util.Map;
+import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
 import javax.crypto.CipherInputStream;
+import javax.crypto.IllegalBlockSizeException;
 import javax.crypto.NoSuchPaddingException;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
@@ -86,7 +88,11 @@ import javax.crypto.spec.SecretKeySpec;
     try {
       cipher.init(Cipher.DECRYPT_MODE, cipherKey, cipherIV);
     } catch (InvalidKeyException | InvalidAlgorithmParameterException e) {
-      throw new RuntimeException(e);
+      // The key or IV material is not usable for AES-CBC. Throw a HlsAesDecryptionException so
+      // hosts can attribute the failure to decryption rather than to network I/O. Note that a
+      // RuntimeException would be wrapped by Loader.UnexpectedLoaderException and surface as an
+      // unspecified error code, indistinguishable from other failures.
+      throw new HlsAesDecryptionException(e);
     }
 
     DataSourceInputStream inputStream = new DataSourceInputStream(upstream, dataSpec);
@@ -99,7 +105,25 @@ import javax.crypto.spec.SecretKeySpec;
   @Override
   public final int read(byte[] buffer, int offset, int length) throws IOException {
     checkNotNull(cipherInputStream);
-    int bytesRead = cipherInputStream.read(buffer, offset, length);
+    int bytesRead;
+    try {
+      bytesRead = cipherInputStream.read(buffer, offset, length);
+    } catch (IOException e) {
+      if (e instanceof HlsAesDecryptionException) {
+        // Never wrap an already tagged exception a second time.
+        throw e;
+      }
+      // CipherInputStream reports decryption failures of the final ciphertext block (e.g. a wrong
+      // key or corrupted data) as an IOException wrapping the cipher's BadPaddingException or
+      // IllegalBlockSizeException, whereas read errors from the upstream data source are
+      // propagated unchanged. Only the former must be tagged as a decryption failure, so that
+      // upstream failures keep surfacing as-is with their original error codes.
+      if (e.getCause() instanceof BadPaddingException
+          || e.getCause() instanceof IllegalBlockSizeException) {
+        throw new HlsAesDecryptionException(e);
+      }
+      throw e;
+    }
     if (bytesRead < 0) {
       return C.RESULT_END_OF_INPUT;
     }
