@@ -390,16 +390,23 @@ public final class MediaCodecUtil {
     }
     if (MimeTypes.VIDEO_DOLBY_VISION.equals(format.sampleMimeType)) {
       // H.264/AVC, H.265/HEVC or AV1 decoders can decode the base layer of some DV profiles.
-      // This can't be done for profile CodecProfileLevel.DolbyVisionProfileDvheStn and profile
-      // CodecProfileLevel.DolbyVisionProfileDvheDtb because the first one is not backward
-      // compatible and the second one is deprecated and is not always backward compatible.
+      // Profile 7 (DolbyVisionProfileDvheDtb) has an HDR10 base layer (CCID 6, as used on UHD
+      // Blu-ray), so HEVC fallback renders it correctly. Mirrors upstream androidx/media#3486.
+      // Profile 5 (DolbyVisionProfileDvheStn) has an IPT-PQ-c2 base layer that is not HEVC
+      // compatible, so HEVC fallback renders it with wrong colors. This fork still allows the
+      // fallback: a picture with wrong colors (the behavior before Dolby Vision was detected in
+      // MPEG-TS) is preferred over failing when no Dolby Vision decoder is available. Devices
+      // that do have a Dolby Vision decoder keep preferring it, see
+      // MediaCodecVideoRenderer#getDecoderInfos.
       @Nullable
       MediaCodecProfileAndLevel codecProfileAndLevel =
           CodecSpecificDataUtil.getMediaCodecProfileAndLevel(format);
       if (codecProfileAndLevel != null && codecProfileAndLevel.isSupportableByMediaCodec()) {
         int profile = codecProfileAndLevel.getProfile();
         if (profile == CodecProfileLevel.DolbyVisionProfileDvheDtr
-            || profile == CodecProfileLevel.DolbyVisionProfileDvheSt) {
+            || profile == CodecProfileLevel.DolbyVisionProfileDvheSt
+            || profile == CodecProfileLevel.DolbyVisionProfileDvheDtb
+            || profile == CodecProfileLevel.DolbyVisionProfileDvheStn) {
           return MimeTypes.VIDEO_H265;
         } else if (profile == CodecProfileLevel.DolbyVisionProfileDvavSe) {
           return MimeTypes.VIDEO_H264;

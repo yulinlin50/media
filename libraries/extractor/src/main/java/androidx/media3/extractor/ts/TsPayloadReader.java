@@ -26,6 +26,7 @@ import androidx.media3.common.ParserException;
 import androidx.media3.common.util.ParsableByteArray;
 import androidx.media3.common.util.TimestampAdjuster;
 import androidx.media3.common.util.UnstableApi;
+import androidx.media3.container.DolbyVisionConfig;
 import androidx.media3.extractor.ExtractorOutput;
 import androidx.media3.extractor.TrackOutput;
 import java.lang.annotation.Documented;
@@ -112,6 +113,28 @@ public interface TsPayloadReader {
     public final List<DvbSubtitleInfo> dvbSubtitleInfos;
     public final byte[] descriptorBytes;
 
+    /** The Dolby Vision configuration signalled in the PMT, or {@code null} if not present. */
+    @Nullable public final DolbyVisionConfig dolbyVisionConfig;
+
+    /**
+     * @deprecated Use {@link #EsInfo(int, String, int, List, byte[], DolbyVisionConfig)} instead.
+     */
+    @Deprecated
+    public EsInfo(
+        int streamType,
+        @Nullable String language,
+        @AudioType int audioType,
+        @Nullable List<DvbSubtitleInfo> dvbSubtitleInfos,
+        byte[] descriptorBytes) {
+      this(
+          streamType,
+          language,
+          audioType,
+          dvbSubtitleInfos,
+          descriptorBytes,
+          /* dolbyVisionConfig= */ null);
+    }
+
     /**
      * @param streamType The type of the stream as defined by the {@link TsExtractor}{@code
      *     .TS_STREAM_TYPE_*}.
@@ -119,13 +142,16 @@ public interface TsPayloadReader {
      * @param audioType The audio type of the stream, as defined by ISO/IEC 13818-1, section 2.6.18.
      * @param dvbSubtitleInfos Information about DVB subtitles associated to the stream.
      * @param descriptorBytes The descriptor bytes associated to the stream.
+     * @param dolbyVisionConfig The Dolby Vision configuration signalled in the PMT, or {@code null}
+     *     if not present.
      */
     public EsInfo(
         int streamType,
         @Nullable String language,
         @AudioType int audioType,
         @Nullable List<DvbSubtitleInfo> dvbSubtitleInfos,
-        byte[] descriptorBytes) {
+        byte[] descriptorBytes,
+        @Nullable DolbyVisionConfig dolbyVisionConfig) {
       this.streamType = streamType;
       this.language = language;
       this.audioType = audioType;
@@ -134,6 +160,7 @@ public interface TsPayloadReader {
               ? Collections.emptyList()
               : Collections.unmodifiableList(dvbSubtitleInfos);
       this.descriptorBytes = descriptorBytes;
+      this.dolbyVisionConfig = dolbyVisionConfig;
     }
   }
 

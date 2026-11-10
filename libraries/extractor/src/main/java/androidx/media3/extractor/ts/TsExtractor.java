@@ -35,6 +35,7 @@ import androidx.media3.common.util.ParsableByteArray;
 import androidx.media3.common.util.TimestampAdjuster;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.common.util.Util;
+import androidx.media3.container.DolbyVisionConfig;
 import androidx.media3.extractor.Extractor;
 import androidx.media3.extractor.ExtractorInput;
 import androidx.media3.extractor.ExtractorOutput;
@@ -156,6 +157,7 @@ public final class TsExtractor implements Extractor {
   private static final long E_AC3_FORMAT_IDENTIFIER = 0x45414333;
   private static final long AC4_FORMAT_IDENTIFIER = 0x41432d34;
   private static final long HEVC_FORMAT_IDENTIFIER = 0x48455643;
+  private static final long DOVI_FORMAT_IDENTIFIER = 0x444f5649; // "DOVI"
 
   private static final int BUFFER_SIZE = TS_PACKET_SIZE * 50;
   private static final int SNIFF_TS_PACKET_COUNT = 5;
@@ -624,6 +626,18 @@ public final class TsExtractor implements Extractor {
     id3Reader = null;
   }
 
+  /**
+   * Returns whether a PMT stream_type value may legitimately carry a Dolby Vision video descriptor
+   * (tag 0xB0). The tag lies in the ISO/IEC 13818-1 user private range, so the descriptor is only
+   * trusted on HEVC (0x24), AVC (0x1B) and private data PES (0x06) elementary streams, which guards
+   * against collisions with other vendors' private descriptors.
+   */
+  private static boolean isDolbyVisionCapableStreamType(int streamType) {
+    return streamType == TS_STREAM_TYPE_H265
+        || streamType == TS_STREAM_TYPE_H264
+        || streamType == 0x06; // PES packets containing private data.
+  }
+
   /** Parses Program Association Table data. */
   private class PatReader implements SectionPayloadReader {
 
@@ -690,6 +704,7 @@ public final class TsExtractor implements Extractor {
     private static final int TS_PMT_DESC_DTS = 0x7B;
     private static final int TS_PMT_DESC_DVB_EXT = 0x7F;
     private static final int TS_PMT_DESC_DVBSUBS = 0x59;
+    private static final int TS_PMT_DESC_DOVI = 0xB0;
 
     private static final int TS_PMT_DESC_DVB_EXT_AC4 = 0x15;
     private static final int TS_PMT_DESC_DVB_EXT_DTS_HD = 0x0E;
@@ -764,7 +779,13 @@ public final class TsExtractor implements Extractor {
         // Setup an ID3 track regardless of whether there's a corresponding entry, in case one
         // appears intermittently during playback. See [Internal: b/20261500].
         EsInfo id3EsInfo =
-            new EsInfo(TS_STREAM_TYPE_ID3, null, AUDIO_TYPE_UNDEFINED, null, Util.EMPTY_BYTE_ARRAY);
+            new EsInfo(
+                TS_STREAM_TYPE_ID3,
+                null,
+                AUDIO_TYPE_UNDEFINED,
+                null,
+                Util.EMPTY_BYTE_ARRAY,
+                /* dolbyVisionConfig= */ null);
         id3Reader = payloadReaderFactory.createPayloadReader(TS_STREAM_TYPE_ID3, id3EsInfo);
         if (id3Reader != null) {
           id3Reader.init(
@@ -784,7 +805,7 @@ public final class TsExtractor implements Extractor {
         int elementaryPid = pmtScratch.readBits(13);
         pmtScratch.skipBits(4); // reserved
         int esInfoLength = pmtScratch.readBits(12); // ES_info_length.
-        EsInfo esInfo = readEsInfo(sectionData, esInfoLength);
+        EsInfo esInfo = readEsInfo(sectionData, esInfoLength, streamType);
         if (streamType == 0x06 || streamType == 0x05) {
           streamType = esInfo.streamType;
         }
@@ -847,15 +868,17 @@ public final class TsExtractor implements Extractor {
      *
      * @param data A buffer with its position set to the start of the first descriptor.
      * @param length The length of descriptors to read from the current position in {@code data}.
+     * @param pmtStreamType The stream_type signalled for the elementary stream in the PMT entry.
      * @return The stream info read from the available descriptors.
      */
-    private EsInfo readEsInfo(ParsableByteArray data, int length) {
+    private EsInfo readEsInfo(ParsableByteArray data, int length, int pmtStreamType) {
       int descriptorsStartPosition = data.getPosition();
       int descriptorsEndPosition = descriptorsStartPosition + length;
       int streamType = -1;
       String language = null;
       @EsInfo.AudioType int audioType = AUDIO_TYPE_UNDEFINED;
       List<DvbSubtitleInfo> dvbSubtitleInfos = null;
+      @Nullable DolbyVisionConfig dolbyVisionConfig = null;
       while (data.getPosition() < descriptorsEndPosition) {
         int descriptorTag = data.readUnsignedByte();
         int descriptorLength = data.readUnsignedByte();
@@ -874,6 +897,50 @@ public final class TsExtractor implements Extractor {
             streamType = TS_STREAM_TYPE_AC4;
           } else if (formatIdentifier == HEVC_FORMAT_IDENTIFIER) {
             streamType = TS_STREAM_TYPE_H265;
+          } else if (formatIdentifier == DOVI_FORMAT_IDENTIFIER) {
+            // The DOVI registration descriptor signals a Dolby Vision stream but carries no
+            // profile/level information. Full Dolby Vision treatment (format and colour-info
+            // override) requires a co-located TS_PMT_DESC_DOVI (0xB0) descriptor in the same ES
+            // loop.
+            streamType = TS_STREAM_TYPE_H265;
+          }
+        } else if (descriptorTag == TS_PMT_DESC_DOVI) {
+          // Dolby Vision video descriptor. Its first 4 bytes share the dvcC record layout:
+          // dv_version_major(8), dv_version_minor(8), dv_profile(7), dv_level(6),
+          // rpu_present_flag(1), el_present_flag(1), bl_present_flag(1).
+          //
+          // Tag 0xB0 lies in the ISO/IEC 13818-1 user private range, so the descriptor is only
+          // trusted when its length, the PMT stream_type and the version/flag fields are all
+          // consistent with a Dolby Vision base layer. This guards against collisions with other
+          // vendors' private descriptors that happen to reuse the tag.
+          if (descriptorLength >= 4 && isDolbyVisionCapableStreamType(pmtStreamType)) {
+            int descriptorDataPosition = data.getPosition();
+            int dvVersionMajor = data.readUnsignedByte();
+            data.skipBytes(1); // dv_version_minor
+            int dvProfile = data.readUnsignedByte() >> 1;
+            int flagBits = data.readUnsignedByte();
+            boolean rpuPresentFlag = ((flagBits >> 2) & 0x1) == 1;
+            boolean blPresentFlag = (flagBits & 0x1) == 1;
+            // Enhancement-layer-only PIDs (bl_present_flag == 0) are ignored, as the base layer
+            // PID carries its own descriptor and the EL cannot be decoded on its own.
+            if (dvVersionMajor == 1 && rpuPresentFlag && blPresentFlag) {
+              if (dvProfile == 9) {
+                // AVC base layer, which is SDR backward-compatible. Expose it as plain H.264
+                // without a Dolby Vision configuration.
+                streamType = TS_STREAM_TYPE_H264;
+              } else {
+                data.setPosition(descriptorDataPosition);
+                @Nullable DolbyVisionConfig config = DolbyVisionConfig.parse(data);
+                if (config != null
+                    && (config.profile == 4
+                        || config.profile == 5
+                        || config.profile == 7
+                        || config.profile == 8)) {
+                  streamType = TS_STREAM_TYPE_H265;
+                  dolbyVisionConfig = config;
+                }
+              }
+            }
           }
         } else if (descriptorTag == TS_PMT_DESC_AC3) { // AC-3_descriptor in DVB (ETSI EN 300 468)
           streamType = TS_STREAM_TYPE_AC3;
@@ -920,7 +987,8 @@ public final class TsExtractor implements Extractor {
           language,
           audioType,
           dvbSubtitleInfos,
-          Arrays.copyOfRange(data.getData(), descriptorsStartPosition, descriptorsEndPosition));
+          Arrays.copyOfRange(data.getData(), descriptorsStartPosition, descriptorsEndPosition),
+          dolbyVisionConfig);
     }
   }
 }

@@ -65,6 +65,7 @@ import androidx.media3.common.Timeline;
 import androidx.media3.common.VideoFrameProcessor;
 import androidx.media3.common.VideoSize;
 import androidx.media3.common.util.CodecSpecificDataUtil;
+import androidx.media3.common.util.CodecSpecificDataUtil.MediaCodecProfileAndLevel;
 import androidx.media3.common.util.ExperimentalApi;
 import androidx.media3.common.util.Log;
 import androidx.media3.common.util.MediaFormatUtil;
@@ -911,7 +912,8 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
     }
     if (SDK_INT >= 26
         && MimeTypes.VIDEO_DOLBY_VISION.equals(format.sampleMimeType)
-        && !Api26.doesDisplaySupportDolbyVision(context)) {
+        && !Api26.doesDisplaySupportDolbyVision(context)
+        && !isDolbyVisionProfileWithoutCompatibleBaseLayer(format)) {
       List<MediaCodecInfo> alternativeDecoderInfos =
           MediaCodecUtil.getAlternativeDecoderInfos(
               mediaCodecSelector, format, requiresSecureDecoder, requiresTunnelingDecoder);
@@ -921,6 +923,26 @@ public class MediaCodecVideoRenderer extends MediaCodecRenderer
     }
     return MediaCodecUtil.getDecoderInfosSoftMatch(
         mediaCodecSelector, format, requiresSecureDecoder, requiresTunnelingDecoder);
+  }
+
+  /**
+   * Returns whether the format is a Dolby Vision profile whose base layer cannot be rendered with
+   * correct colors by a non-Dolby Vision decoder.
+   *
+   * <p>This is only profile 5 ({@link CodecProfileLevel#DolbyVisionProfileDvheStn}), whose
+   * IPT-PQ-c2 base layer is not HEVC compatible. For such a format a Dolby Vision decoder must be
+   * preferred even when the display does not support Dolby Vision, because the decoder can still
+   * apply the RPU metadata and produce correct colors, whereas the alternative HEVC decoder renders
+   * wrong colors. The alternative decoder is still used as a last resort by {@link
+   * MediaCodecUtil#getDecoderInfosSoftMatch} when no Dolby Vision decoder is available.
+   */
+  private static boolean isDolbyVisionProfileWithoutCompatibleBaseLayer(Format format) {
+    @Nullable
+    MediaCodecProfileAndLevel profileAndLevel =
+        CodecSpecificDataUtil.getMediaCodecProfileAndLevel(format);
+    return profileAndLevel != null
+        && profileAndLevel.isSupportableByMediaCodec()
+        && profileAndLevel.getProfile() == CodecProfileLevel.DolbyVisionProfileDvheStn;
   }
 
   @RequiresApi(26)

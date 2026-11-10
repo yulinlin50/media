@@ -21,12 +21,15 @@ import static androidx.media3.extractor.ts.TsExtractor.DEFAULT_TIMESTAMP_SEARCH_
 import static androidx.media3.extractor.ts.TsExtractor.FLAG_EMIT_RAW_SUBTITLE_DATA;
 import static androidx.media3.extractor.ts.TsExtractor.MODE_MULTI_PMT;
 import static androidx.media3.extractor.ts.TsExtractor.MODE_SINGLE_PMT;
+import static androidx.media3.test.utils.TestUtil.createByteArray;
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.truth.Truth.assertThat;
 
 import android.util.SparseArray;
 import androidx.annotation.Nullable;
 import androidx.media3.common.C;
 import androidx.media3.common.Format;
+import androidx.media3.common.MimeTypes;
 import androidx.media3.common.util.ParsableByteArray;
 import androidx.media3.common.util.TimestampAdjuster;
 import androidx.media3.extractor.Extractor;
@@ -43,6 +46,7 @@ import androidx.media3.test.utils.FakeExtractorOutput;
 import androidx.media3.test.utils.FakeTrackOutput;
 import androidx.media3.test.utils.TestUtil;
 import androidx.test.core.app.ApplicationProvider;
+import com.google.common.primitives.Bytes;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.Test;
@@ -465,6 +469,374 @@ public final class TsExtractorTest {
     }
     assertThat(factory.sdtReader.consumedSdts).isEqualTo(2);
     tsExtractor.release();
+  }
+
+  @Test
+  public void pmtDolbyVisionDescriptorOnPrivateDataStream_outputsDolbyVisionFormat()
+      throws Exception {
+    // Profile 5 signalled by a "DOVI" registration descriptor followed by a Dolby Vision video
+    // descriptor (0xB0) on a private data PES (0x06) stream type.
+    byte[] ts =
+        buildSyntheticTs(
+            /* streamType= */ 0x06,
+            DOVI_REGISTRATION_DESCRIPTOR,
+            buildDolbyVisionDescriptor(
+                /* dvVersionMajor= */ 1,
+                /* profile= */ 5,
+                /* rpuPresentFlag= */ true,
+                /* blPresentFlag= */ true));
+
+    FakeExtractorOutput output = extractTs(ts);
+
+    assertThat(output.numberOfTracks).isEqualTo(1);
+    FakeTrackOutput trackOutput = output.trackOutputs.get(VIDEO_PID);
+    assertThat(trackOutput).isNotNull();
+    assertThat(trackOutput.lastFormat).isNotNull();
+    assertThat(trackOutput.lastFormat.sampleMimeType).isEqualTo(MimeTypes.VIDEO_DOLBY_VISION);
+    assertThat(trackOutput.lastFormat.codecs).isEqualTo("dvhe.05.00");
+    // The fed SPS carries no VUI colour signalling, so profile 5 colour info is synthesized.
+    assertThat(trackOutput.lastFormat.colorInfo).isNotNull();
+    assertThat(trackOutput.lastFormat.colorInfo.colorSpace).isEqualTo(C.COLOR_SPACE_BT2020);
+    assertThat(trackOutput.lastFormat.colorInfo.colorRange).isEqualTo(C.COLOR_RANGE_LIMITED);
+    assertThat(trackOutput.lastFormat.colorInfo.colorTransfer).isEqualTo(C.COLOR_TRANSFER_ST2084);
+  }
+
+  @Test
+  public void pmtDolbyVisionDescriptorOnHevcStream_outputsDolbyVisionFormat() throws Exception {
+    // Profile 8 signalled by only a Dolby Vision video descriptor (0xB0) on a HEVC (0x24) stream
+    // type, without a registration descriptor.
+    byte[] ts =
+        buildSyntheticTs(
+            /* streamType= */ 0x24,
+            buildDolbyVisionDescriptor(
+                /* dvVersionMajor= */ 1,
+                /* profile= */ 8,
+                /* rpuPresentFlag= */ true,
+                /* blPresentFlag= */ true));
+
+    FakeExtractorOutput output = extractTs(ts);
+
+    assertThat(output.numberOfTracks).isEqualTo(1);
+    FakeTrackOutput trackOutput = output.trackOutputs.get(VIDEO_PID);
+    assertThat(trackOutput).isNotNull();
+    assertThat(trackOutput.lastFormat).isNotNull();
+    assertThat(trackOutput.lastFormat.sampleMimeType).isEqualTo(MimeTypes.VIDEO_DOLBY_VISION);
+    assertThat(trackOutput.lastFormat.codecs).isEqualTo("dvhe.08.00");
+    // Cross-compatible profiles keep the SPS-signalled colour info, which stays unset here.
+    assertThat(trackOutput.lastFormat.colorInfo).isNotNull();
+    assertThat(trackOutput.lastFormat.colorInfo.colorSpace).isEqualTo(Format.NO_VALUE);
+    assertThat(trackOutput.lastFormat.colorInfo.colorRange).isEqualTo(Format.NO_VALUE);
+    assertThat(trackOutput.lastFormat.colorInfo.colorTransfer).isEqualTo(Format.NO_VALUE);
+  }
+
+  @Test
+  public void pmtDolbyVisionDescriptorWithUnsupportedVersionMajor_dropsTrack() throws Exception {
+    byte[] ts =
+        buildSyntheticTs(
+            /* streamType= */ 0x06,
+            buildDolbyVisionDescriptor(
+                /* dvVersionMajor= */ 2,
+                /* profile= */ 5,
+                /* rpuPresentFlag= */ true,
+                /* blPresentFlag= */ true));
+
+    FakeExtractorOutput output = extractTs(ts);
+
+    assertThat(output.numberOfTracks).isEqualTo(0);
+    assertThat(output.trackOutputs.get(VIDEO_PID)).isNull();
+  }
+
+  @Test
+  public void pmtDolbyVisionDescriptorWithoutRpuPresentFlag_dropsTrack() throws Exception {
+    byte[] ts =
+        buildSyntheticTs(
+            /* streamType= */ 0x06,
+            buildDolbyVisionDescriptor(
+                /* dvVersionMajor= */ 1,
+                /* profile= */ 5,
+                /* rpuPresentFlag= */ false,
+                /* blPresentFlag= */ true));
+
+    FakeExtractorOutput output = extractTs(ts);
+
+    assertThat(output.numberOfTracks).isEqualTo(0);
+    assertThat(output.trackOutputs.get(VIDEO_PID)).isNull();
+  }
+
+  @Test
+  public void pmtDolbyVisionDescriptorWithoutBlPresentFlag_dropsTrack() throws Exception {
+    // An enhancement-layer-only PID, which cannot be decoded on its own and is ignored.
+    byte[] ts =
+        buildSyntheticTs(
+            /* streamType= */ 0x06,
+            buildDolbyVisionDescriptor(
+                /* dvVersionMajor= */ 1,
+                /* profile= */ 5,
+                /* rpuPresentFlag= */ true,
+                /* blPresentFlag= */ false));
+
+    FakeExtractorOutput output = extractTs(ts);
+
+    assertThat(output.numberOfTracks).isEqualTo(0);
+    assertThat(output.trackOutputs.get(VIDEO_PID)).isNull();
+  }
+
+  @Test
+  public void pmtDolbyVisionProfile9OnAvcStream_outputsPlainAvcTrack() throws Exception {
+    // Profile 9 (AVC base layer) on an AVC (0x1B) stream type is exposed as plain H.264, without a
+    // Dolby Vision configuration.
+    byte[] ts =
+        buildSyntheticTs(
+            /* streamType= */ 0x1B,
+            buildDolbyVisionDescriptor(
+                /* dvVersionMajor= */ 1,
+                /* profile= */ 9,
+                /* rpuPresentFlag= */ true,
+                /* blPresentFlag= */ true));
+
+    FakeExtractorOutput output = extractTs(ts);
+
+    assertThat(output.numberOfTracks).isEqualTo(1);
+    FakeTrackOutput trackOutput = output.trackOutputs.get(VIDEO_PID);
+    assertThat(trackOutput).isNotNull();
+    // The fed parameter sets are H.265 NAL units that the H.264 reader does not recognize, so no
+    // format is emitted for the H.264 track.
+    assertThat(trackOutput.lastFormat).isNull();
+  }
+
+  @Test
+  public void pmtDolbyVisionDescriptorOnPrivateSectionsStream_dropsTrack() throws Exception {
+    // The 0xB0 tag lies in the ISO/IEC 13818-1 user private range and must not be trusted on
+    // stream types other than HEVC (0x24), AVC (0x1B) and private data PES (0x06).
+    byte[] ts =
+        buildSyntheticTs(
+            /* streamType= */ 0x05,
+            buildDolbyVisionDescriptor(
+                /* dvVersionMajor= */ 1,
+                /* profile= */ 5,
+                /* rpuPresentFlag= */ true,
+                /* blPresentFlag= */ true));
+
+    FakeExtractorOutput output = extractTs(ts);
+
+    assertThat(output.numberOfTracks).isEqualTo(0);
+    assertThat(output.trackOutputs.get(VIDEO_PID)).isNull();
+  }
+
+  // Synthetic TS support for the Dolby Vision PMT tests above.
+
+  private static final int TS_PACKET_SIZE = 188;
+  private static final int PAT_PID = 0x0000;
+  private static final int PMT_PID = 0x1000;
+  private static final int VIDEO_PID = 0x101;
+
+  // CRC-32 with polynomial 0x04C11DB7 in most significant bit first order, as required for PSI
+  // sections. See ISO/IEC 13818-1, Annex A.
+  private static final int[] CRC32_MSBF_TABLE = buildCrc32MsbfTable();
+
+  private static int[] buildCrc32MsbfTable() {
+    int[] table = new int[256];
+    for (int i = 0; i < 256; i++) {
+      int crc = i << 24;
+      for (int bit = 0; bit < 8; bit++) {
+        crc = ((crc & 0x80000000) != 0) ? ((crc << 1) ^ 0x04C11DB7) : (crc << 1);
+      }
+      table[i] = crc;
+    }
+    return table;
+  }
+
+  private static int crc32(byte[] data, int length) {
+    int crc = 0xFFFFFFFF;
+    for (int i = 0; i < length; i++) {
+      crc = (crc << 8) ^ CRC32_MSBF_TABLE[((crc >>> 24) ^ (data[i] & 0xFF)) & 0xFF];
+    }
+    return crc;
+  }
+
+  /** Appends the CRC-32 of {@code section[0:offset]} to {@code section} at {@code offset}. */
+  private static void appendCrc32(byte[] section, int offset) {
+    int crc = crc32(section, offset);
+    section[offset] = (byte) ((crc >>> 24) & 0xFF);
+    section[offset + 1] = (byte) ((crc >>> 16) & 0xFF);
+    section[offset + 2] = (byte) ((crc >>> 8) & 0xFF);
+    section[offset + 3] = (byte) (crc & 0xFF);
+  }
+
+  private static final byte[] DOVI_REGISTRATION_DESCRIPTOR =
+      createByteArray(0x05, 0x04, 0x44, 0x4F, 0x56, 0x49); // registration_descriptor("DOVI")
+
+  /**
+   * Builds a Dolby Vision video descriptor (tag 0xB0) carrying the given version major, profile
+   * and RPU/base-layer presence flags, at level 0.
+   */
+  private static byte[] buildDolbyVisionDescriptor(
+      int dvVersionMajor, int profile, boolean rpuPresentFlag, boolean blPresentFlag) {
+    int flagBits = (rpuPresentFlag ? 0x04 : 0x00) | (blPresentFlag ? 0x01 : 0x00);
+    return createByteArray(
+        0xB0,
+        0x04,
+        dvVersionMajor,
+        0x00, // dv_version_minor
+        profile << 1, // dv_profile(7), dv_level(6) bit 5
+        flagBits); // dv_level(6) bits 4:0, rpu_present_flag, el_present_flag, bl_present_flag
+  }
+
+  /**
+   * Builds a TS stream consisting of a PAT, a PMT with a single ES entry carrying the given
+   * descriptors on {@code streamType}, and one video PES packet with an H.265 access unit.
+   */
+  private static byte[] buildSyntheticTs(int streamType, byte[]... esDescriptors) {
+    return Bytes.concat(
+        psiPacket(PAT_PID, buildPatSection()),
+        psiPacket(PMT_PID, buildPmtSection(streamType, esDescriptors)),
+        pesPacket(VIDEO_PID, buildH265AccessUnit()));
+  }
+
+  private static byte[] buildPatSection() {
+    byte[] section = new byte[12 + 4];
+    section[0] = 0x00; // table_id
+    section[1] = (byte) 0xB0; // section_syntax_indicator, reserved bits, section_length
+    section[2] = 0x0D; // section_length
+    section[3] = 0x00;
+    section[4] = 0x01; // transport_stream_id
+    section[5] = (byte) 0xC1; // reserved, version_number, current_next_indicator
+    section[6] = 0x00; // section_number
+    section[7] = 0x00; // last_section_number
+    section[8] = 0x00;
+    section[9] = 0x01; // program_number = 1
+    section[10] = (byte) 0xF0; // reserved, program_map_PID = PMT_PID
+    section[11] = 0x00;
+    appendCrc32(section, 12);
+    return section;
+  }
+
+  private static byte[] buildPmtSection(int streamType, byte[]... esDescriptors) {
+    int esDescriptorsLength = 0;
+    for (byte[] descriptor : esDescriptors) {
+      esDescriptorsLength += descriptor.length;
+    }
+    // Bytes after the section_length field: program_number (2), version/current_next (1),
+    // section_number (1), last_section_number (1), PCR_PID (2), program_info_length (2), the ES
+    // entry (5 + esDescriptorsLength), and the CRC_32 (4).
+    int sectionLength = 18 + esDescriptorsLength;
+    byte[] section = new byte[3 + sectionLength];
+    section[0] = 0x02; // table_id
+    section[1] = (byte) (0xB0 | ((sectionLength >> 8) & 0x0F));
+    section[2] = (byte) (sectionLength & 0xFF);
+    section[3] = 0x00;
+    section[4] = 0x01; // program_number = 1
+    section[5] = (byte) 0xC1; // reserved, version_number, current_next_indicator
+    section[6] = 0x00; // section_number
+    section[7] = 0x00; // last_section_number
+    section[8] = (byte) 0xFF;
+    section[9] = (byte) 0xFF; // reserved, PCR_PID = 0x1FFF
+    section[10] = (byte) 0xF0; // reserved, program_info_length = 0
+    section[11] = 0x00;
+    int position = 12;
+    section[position++] = (byte) streamType;
+    section[position++] = (byte) 0xE1; // reserved, elementary_PID = VIDEO_PID
+    section[position++] = 0x01;
+    section[position++] = (byte) (0xF0 | ((esDescriptorsLength >> 8) & 0x0F));
+    section[position++] = (byte) (esDescriptorsLength & 0xFF); // ES_info_length
+    for (byte[] descriptor : esDescriptors) {
+      System.arraycopy(descriptor, 0, section, position, descriptor.length);
+      position += descriptor.length;
+    }
+    appendCrc32(section, position);
+    return section;
+  }
+
+  /**
+   * Returns VPS, SPS, PPS and an IDR slice as one Annex B access unit. The parameter sets are taken
+   * from media/ts/sample_h265_rps_pred.ts and match the ones used by {@link H265ReaderTest}.
+   */
+  private static byte[] buildH265AccessUnit() {
+    byte[] startCode = createByteArray(0x00, 0x00, 0x01);
+    byte[] vps =
+        createByteArray(
+            0x40, 0x01, 0x0C, 0x07, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00,
+            0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3F, 0x00, 0x00, 0x99, 0x4C, 0xE6, 0x24, 0xC5,
+            0x81, 0x20);
+    byte[] sps =
+        createByteArray(
+            0x42, 0x01, 0x07, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x3F, 0x00, 0x00, 0xA0, 0x07, 0x32, 0x00, 0xAC, 0x72, 0x56, 0x26,
+            0x65, 0x33, 0x98, 0x93, 0x17, 0x24, 0x8A, 0x41, 0xD2, 0x47, 0x4F, 0x3E, 0x3F, 0xC4,
+            0xFC, 0xB3, 0xF9, 0xFB, 0x3C, 0xBF, 0xD7, 0xCC, 0x87, 0x92, 0xFF, 0x9F, 0xB3, 0xCB,
+            0xFD, 0x7C, 0x12, 0x3A, 0x79, 0xF1, 0xFE, 0x27, 0xE5, 0x3F, 0xCF, 0xDF, 0xCB, 0x3F,
+            0x5F, 0x32, 0x1E, 0x4B, 0xFE, 0x7E, 0xCF, 0x2F, 0xF5, 0xF1, 0xFF, 0xE1, 0x56, 0x81,
+            0x56, 0x60, 0x20, 0x00, 0x00, 0x7D, 0x00, 0x00, 0x07, 0x53, 0x01);
+    byte[] pps = createByteArray(0x44, 0x01, 0xC1, 0x14, 0xA1, 0xC2, 0xB4, 0x13, 0x24);
+    // IDR_W_RADL slice segment with first_slice_segment_in_pic_flag set, followed by arbitrary
+    // slice data.
+    byte[] idrSlice = createByteArray(0x26, 0x01, 0x80, 0x11, 0x22);
+    return Bytes.concat(
+        startCode, vps, startCode, sps, startCode, pps, startCode, idrSlice);
+  }
+
+  /** Wraps a PSI section in a TS packet, preceded by a pointer_field of 0x00. */
+  private static byte[] psiPacket(int pid, byte[] section) {
+    byte[] payload = new byte[section.length + 1];
+    payload[0] = 0x00; // pointer_field
+    System.arraycopy(section, 0, payload, 1, section.length);
+    return tsPacket(pid, /* payloadUnitStartIndicator= */ true, payload);
+  }
+
+  private static byte[] pesPacket(int pid, byte[] esData) {
+    int pesPacketLength = 3 /* header flags */ + 5 /* PTS */ + esData.length;
+    byte[] payload = new byte[14 + esData.length];
+    payload[0] = 0x00;
+    payload[1] = 0x00;
+    payload[2] = 0x01;
+    payload[3] = (byte) 0xE0; // video stream_id
+    payload[4] = (byte) ((pesPacketLength >> 8) & 0xFF);
+    payload[5] = (byte) (pesPacketLength & 0xFF);
+    payload[6] = (byte) 0x84; // '10', data_alignment_indicator set
+    payload[7] = (byte) 0x80; // PTS_DTS_flags = '10'
+    payload[8] = 0x05; // PES_header_data_length
+    long pts = 90_000;
+    payload[9] = (byte) (0x21 | ((pts >> 29) & 0x0E));
+    payload[10] = (byte) ((pts >> 22) & 0xFF);
+    payload[11] = (byte) (0x01 | ((pts >> 14) & 0xFE));
+    payload[12] = (byte) ((pts >> 7) & 0xFF);
+    payload[13] = (byte) (0x01 | ((pts << 1) & 0xFE));
+    System.arraycopy(esData, 0, payload, 14, esData.length);
+    return tsPacket(pid, /* payloadUnitStartIndicator= */ true, payload);
+  }
+
+  private static byte[] tsPacket(int pid, boolean payloadUnitStartIndicator, byte[] payload) {
+    checkArgument(payload.length <= TS_PACKET_SIZE - 4);
+    byte[] packet = new byte[TS_PACKET_SIZE];
+    packet[0] = TsExtractor.TS_SYNC_BYTE;
+    packet[1] = (byte) ((payloadUnitStartIndicator ? 0x40 : 0x00) | ((pid >> 8) & 0x1F));
+    packet[2] = (byte) (pid & 0xFF);
+    packet[3] = (byte) (0x10 /* payload only, no adaptation field */ | 0 /* continuity_counter */);
+    System.arraycopy(payload, 0, packet, 4, payload.length);
+    // Fill the remainder of the packet with stuffing bytes.
+    for (int i = 4 + payload.length; i < TS_PACKET_SIZE; i++) {
+      packet[i] = (byte) 0xFF;
+    }
+    return packet;
+  }
+
+  private FakeExtractorOutput extractTs(byte[] ts) throws Exception {
+    TsExtractor tsExtractor =
+        (TsExtractor)
+            getExtractorFactory(/* subtitlesParsedDuringExtraction= */ true).create();
+    FakeExtractorInput input = new FakeExtractorInput.Builder().setData(ts).build();
+    FakeExtractorOutput output = new FakeExtractorOutput();
+    tsExtractor.init(output);
+    PositionHolder seekPositionHolder = new PositionHolder();
+    int readResult = Extractor.RESULT_CONTINUE;
+    while (readResult != Extractor.RESULT_END_OF_INPUT) {
+      readResult = tsExtractor.read(input, seekPositionHolder);
+      if (readResult == Extractor.RESULT_SEEK) {
+        input.setPosition((int) seekPositionHolder.position);
+      }
+    }
+    tsExtractor.release();
+    return output;
   }
 
   private static ExtractorAsserts.ExtractorFactory getExtractorFactory(

@@ -261,6 +261,28 @@ public final class MediaCodecUtilTest {
   }
 
   @Test
+  public void getAlternativeCodecMimeType_withDolbyVisionProfile5And7_returnsH265() {
+    // Profile 5 (dvhe.05) has an IPT-PQ-c2 base layer that is not HEVC compatible, but the fork
+    // still allows falling back to an HEVC decoder (wrong colors are preferred over no picture).
+    Format formatDvheProfile5 =
+        new Format.Builder()
+            .setSampleMimeType(MimeTypes.VIDEO_DOLBY_VISION)
+            .setCodecs("dvhe.05.06")
+            .build();
+    // Profile 7 (dvhe.07) has an HDR10 base layer, so HEVC fallback renders it correctly.
+    Format formatDvheProfile7 =
+        new Format.Builder()
+            .setSampleMimeType(MimeTypes.VIDEO_DOLBY_VISION)
+            .setCodecs("dvhe.07.06")
+            .build();
+
+    assertThat(MediaCodecUtil.getAlternativeCodecMimeType(formatDvheProfile5))
+        .isEqualTo(MimeTypes.VIDEO_H265);
+    assertThat(MediaCodecUtil.getAlternativeCodecMimeType(formatDvheProfile7))
+        .isEqualTo(MimeTypes.VIDEO_H265);
+  }
+
+  @Test
   public void getAlternativeCodecMimeType_withEac3JocFormatOnNonGoogleDevice_returnsEac3() {
     ShadowBuild.setManufacturer("Samsung");
     Format format = new Format.Builder().setSampleMimeType(MimeTypes.AUDIO_E_AC3_JOC).build();
