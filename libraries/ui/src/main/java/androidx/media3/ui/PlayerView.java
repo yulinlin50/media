@@ -499,7 +499,11 @@ public class PlayerView extends FrameLayout implements AdViewProvider {
       surfaceView = null;
     }
     this.surfaceViewIgnoresVideoAspectRatio = surfaceViewIgnoresVideoAspectRatio;
-    this.surfaceSyncGroupV34 = SDK_INT == 34 ? new SurfaceSyncGroupCompatV34() : null;
+    // LiveSource 本地定制（2026-11-11）：放宽到 34+。上游注释称 b/334901521 在 API 35 已修，
+    // 但 HyperOS/Android 15（API 35）真机仍复现 SurfaceView resize 失同步：应用内小窗→播放页
+    // 的单面瞬移后，605×340 buffer 以 1:1 错位摆进 1080 宽槽位（非对称左黑带贯穿整个播放页
+    // 访问期，30fps 逐帧实测），必须保留 SurfaceSyncGroup 重同步。API 存在于 34+，35 可用。
+    this.surfaceSyncGroupV34 = SDK_INT >= 34 ? new SurfaceSyncGroupCompatV34() : null;
 
     // Ad overlay frame layout.
     adOverlayFrameLayout = findViewById(R.id.exo_ad_overlay);
@@ -1824,7 +1828,7 @@ public class PlayerView extends FrameLayout implements AdViewProvider {
   @Override
   protected void dispatchDraw(Canvas canvas) {
     super.dispatchDraw(canvas);
-    if (SDK_INT == 34 && surfaceSyncGroupV34 != null && enableComposeSurfaceSyncWorkaround) {
+    if (SDK_INT >= 34 && surfaceSyncGroupV34 != null && enableComposeSurfaceSyncWorkaround) {
       surfaceSyncGroupV34.maybeMarkSyncReadyAndClear();
     }
   }
@@ -1889,11 +1893,12 @@ public class PlayerView extends FrameLayout implements AdViewProvider {
 
     @Override
     public void onSurfaceSizeChanged(int width, int height) {
-      if (SDK_INT == 34
+      if (SDK_INT >= 34
           && surfaceView instanceof SurfaceView
           && enableComposeSurfaceSyncWorkaround) {
         // Register a SurfaceSyncGroup to work around https://github.com/androidx/media/issues/1237
-        // (only present on API 34, fixed on API 35).
+        // (upstream: "only present on API 34, fixed on API 35" — LiveSource: HyperOS/Android 15
+        // still exhibits the desync on SurfaceView resize, keep enabled on 34+).
         checkNotNull(surfaceSyncGroupV34)
             .postRegister(
                 mainLooperHandler, (SurfaceView) surfaceView, PlayerView.this::invalidate);
