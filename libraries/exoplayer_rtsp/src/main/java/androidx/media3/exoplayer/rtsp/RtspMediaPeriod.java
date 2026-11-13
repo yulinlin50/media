@@ -832,6 +832,12 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
           // using TCP. Retrying will setup new loadables, so will not retry with the current
           // loadables.
           retryWithRtpTcp();
+        } else if (loadable.hasRtpTimedOut()) {
+          // Fork addition (2026-11-13): TCP interleaved load ended by the RTP read timeout with
+          // zero samples received — the server stopped sending data entirely. Returning silently
+          // here left the player stuck in BUFFERING forever; surface the stall as a playback
+          // error (thrown from SampleStreamImpl.maybeThrowError) so the player can recover.
+          playbackException = new RtspPlaybackException(/* message= */ "RTP data load timed out");
         }
         return;
       }
@@ -843,6 +849,15 @@ import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
           loaderWrapper.cancelLoad();
           break;
         }
+      }
+
+      if (loadable.hasRtpTimedOut()) {
+        // Fork addition (2026-11-13): the RTP read timeout elapsed mid-stream and the data
+        // channel then ended (EOS). Reporting a normal end of playback here
+        // (signalPlaybackEnded -> Player.STATE_ENDED) silently stopped a live stream with no
+        // error and no recovery; surface the stall as a playback error instead.
+        playbackException = new RtspPlaybackException(/* message= */ "RTP data load timed out");
+        return;
       }
 
       rtspClient.signalPlaybackEnded();
