@@ -25,6 +25,7 @@ import static java.lang.Math.min;
 import static java.lang.Runtime.getRuntime;
 
 import android.content.ContentResolver;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import androidx.annotation.GuardedBy;
 import androidx.annotation.Nullable;
@@ -56,6 +57,8 @@ import java.util.concurrent.ConcurrentHashMap;
 /** The default {@link LoadControl} implementation. */
 @UnstableApi
 public class DefaultLoadControl implements LoadControl {
+
+  private static final long TARGET_BUFFER_WARNING_LOG_INTERVAL_MS = 5_000;
 
   /**
    * The default minimum duration of media that the player will attempt to ensure is buffered at all
@@ -576,6 +579,7 @@ public class DefaultLoadControl implements LoadControl {
   private final boolean retainBackBufferFromKeyframe;
   private final ImmutableMap<String, Integer> playerTargetBufferBytesOverwrites;
   private final ConcurrentHashMap<PlayerId, PlayerLoadingState> loadingStates;
+  private final TargetBufferWarningTracker targetBufferWarningTracker;
 
   private long threadId;
 
@@ -667,6 +671,7 @@ public class DefaultLoadControl implements LoadControl {
     this.backBufferDurationUs = msToUs(backBufferDurationMs);
     this.retainBackBufferFromKeyframe = retainBackBufferFromKeyframe;
     loadingStates = new ConcurrentHashMap<>();
+    targetBufferWarningTracker = new TargetBufferWarningTracker();
     playerTargetBufferBytesOverwrites = ImmutableMap.copyOf(playerTargetBufferBytes);
     threadId = C.INDEX_UNSET;
   }
@@ -706,6 +711,7 @@ public class DefaultLoadControl implements LoadControl {
 
   @Override
   public void onPrepared(PlayerId playerId) {
+    finishTargetBufferWarning(playerId);
     long currentThreadId = Thread.currentThread().getId();
     checkState(
         threadId == C.INDEX_UNSET || threadId == currentThreadId,
@@ -736,11 +742,13 @@ public class DefaultLoadControl implements LoadControl {
 
   @Override
   public void onStopped(PlayerId playerId) {
+    finishTargetBufferWarning(playerId);
     removePlayer(playerId);
   }
 
   @Override
   public void onReleased(PlayerId playerId) {
+    finishTargetBufferWarning(playerId);
     removePlayer(playerId);
     if (loadingStates.isEmpty()) {
       threadId = C.INDEX_UNSET;
@@ -799,12 +807,24 @@ public class DefaultLoadControl implements LoadControl {
             "Stopped loading before minBufferUs reached due to memory pressure, despite "
                 + "prioritizeTimeOverSizeThresholds=true.");
       }
-      if (!playerLoadingState.isLoading && parameters.bufferedDurationUs < 500_000) {
-        Log.w(TAG, "Target buffer size reached with less than 500ms of buffered media data.");
-      }
     } else if (parameters.bufferedDurationUs >= maxBufferUs || targetBufferSizeReached) {
       playerLoadingState.isLoading = false;
     } // Else don't change the loading state.
+    if (!playerLoadingState.isLoading && parameters.bufferedDurationUs < 500_000) {
+      TargetBufferWarningTracker.Event event =
+          targetBufferWarningTracker.onWarning(playerId, SystemClock.elapsedRealtime());
+      if (event != null) {
+        Log.w(
+            TAG,
+            "Target buffer size reached with less than 500ms of buffered media data. "
+                + "occurrences="
+                + event.occurrenceCount
+                + " durationMs="
+                + event.durationMs);
+      }
+    } else {
+      finishTargetBufferWarning(playerId);
+    }
     return playerLoadingState.isLoading;
   }
 
@@ -910,6 +930,79 @@ public class DefaultLoadControl implements LoadControl {
       if (playerLoadingState.referenceCount == 0) {
         loadingStates.remove(playerId);
         updateAllocator();
+      }
+    }
+  }
+
+  private void finishTargetBufferWarning(PlayerId playerId) {
+    TargetBufferWarningTracker.Event event =
+        targetBufferWarningTracker.finish(playerId, SystemClock.elapsedRealtime());
+    if (event != null) {
+      Log.i(
+          TAG,
+          "Target buffer warning condition ended. occurrences="
+              + event.occurrenceCount
+              + " durationMs="
+              + event.durationMs);
+    }
+  }
+
+  /** Per-player warning episodes; this only controls logging and never affects load decisions. */
+  @VisibleForTesting
+  /* package */ static final class TargetBufferWarningTracker {
+    private final Map<PlayerId, Episode> episodes;
+
+    public TargetBufferWarningTracker() {
+      episodes = new HashMap<>();
+    }
+
+    @Nullable
+    public synchronized Event onWarning(PlayerId playerId, long nowMs) {
+      Episode episode = episodes.get(playerId);
+      if (episode == null) {
+        episode = new Episode(nowMs);
+        episodes.put(playerId, episode);
+      }
+      episode.occurrenceCount++;
+      if (episode.occurrenceCount == 1
+          || nowMs - episode.lastWarningLogAtMs >= TARGET_BUFFER_WARNING_LOG_INTERVAL_MS) {
+        episode.lastWarningLogAtMs = nowMs;
+        return new Event(episode.occurrenceCount, Math.max(0, nowMs - episode.startedAtMs));
+      }
+      return null;
+    }
+
+    @Nullable
+    public synchronized Event finish(PlayerId playerId, long nowMs) {
+      Episode episode = episodes.remove(playerId);
+      if (episode == null) {
+        return null;
+      }
+      return new Event(episode.occurrenceCount, Math.max(0, nowMs - episode.startedAtMs));
+    }
+
+    @VisibleForTesting
+    /* package */ synchronized boolean hasEpisode(PlayerId playerId) {
+      return episodes.containsKey(playerId);
+    }
+
+    static final class Event {
+      public final int occurrenceCount;
+      public final long durationMs;
+
+      Event(int occurrenceCount, long durationMs) {
+        this.occurrenceCount = occurrenceCount;
+        this.durationMs = durationMs;
+      }
+    }
+
+    private static final class Episode {
+      public final long startedAtMs;
+      public int occurrenceCount;
+      public long lastWarningLogAtMs;
+
+      Episode(long nowMs) {
+        startedAtMs = nowMs;
       }
     }
   }

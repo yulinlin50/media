@@ -143,6 +143,28 @@ public class DefaultLoadControlTest {
   }
 
   @Test
+  public void targetBufferWarningThrottleDoesNotChangeLoadingDecision() {
+    build();
+    makeSureTargetBufferBytesReached(playerId);
+    LoadControl.Parameters lowBufferParameters =
+        new LoadControl.Parameters(
+            playerId,
+            timeline,
+            mediaPeriodId,
+            /* playbackPositionUs= */ 0L,
+            /* bufferedDurationUs= */ 0L,
+            SPEED,
+            /* playWhenReady= */ false,
+            /* rebuffering= */ false,
+            /* targetLiveOffsetUs= */ C.TIME_UNSET,
+            /* lastRebufferRealtimeMs= */ C.TIME_UNSET);
+
+    assertThat(loadControl.shouldContinueLoading(lowBufferParameters)).isFalse();
+    assertThat(loadControl.shouldContinueLoading(lowBufferParameters)).isFalse();
+    assertThat(loadControl.shouldContinueLoading(lowBufferParameters)).isFalse();
+  }
+
+  @Test
   public void shouldContinueLoading_forLocalPlayback_trueUntilMaxBufferExceeded() {
     build();
     assertThat(
