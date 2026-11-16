@@ -47,6 +47,7 @@ import java.net.MalformedURLException;
 import java.net.NoRouteToHostException;
 import java.net.URL;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -78,6 +79,7 @@ public class DefaultHttpDataSource extends BaseDataSource implements HttpDataSou
     private boolean allowCrossProtocolRedirects;
     private boolean crossProtocolRedirectsForceOriginal;
     private boolean keepPostFor302Redirects;
+    private boolean stripCredentialHeadersOnCrossOriginRedirects;
 
     /** Creates an instance. */
     public Factory() {
@@ -218,6 +220,30 @@ public class DefaultHttpDataSource extends BaseDataSource implements HttpDataSou
       return this;
     }
 
+    /**
+     * Sets whether credential headers ({@code Cookie} and {@code Authorization}) are stripped when
+     * following a redirect to a different origin (protocol, host and port all taken into account).
+     * Only applies when redirects are handled manually, which is the case when {@code
+     * allowCrossProtocolRedirects}, {@code crossProtocolRedirectsForceOriginal} or {@code
+     * keepPostFor302Redirects} is set. When redirects are followed automatically by {@link
+     * HttpURLConnection} this setting has no effect, because automatic following is performed by
+     * the platform.
+     *
+     * <p>The default is {@code false}.
+     *
+     * @param stripCredentialHeadersOnCrossOriginRedirects Whether to strip credential headers on
+     *     redirects to a different origin.
+     * @return This factory.
+     */
+    @CanIgnoreReturnValue
+    @UnstableApi
+    public Factory setStripCredentialHeadersOnCrossOriginRedirects(
+        boolean stripCredentialHeadersOnCrossOriginRedirects) {
+      this.stripCredentialHeadersOnCrossOriginRedirects =
+          stripCredentialHeadersOnCrossOriginRedirects;
+      return this;
+    }
+
     @UnstableApi
     @Override
     public DefaultHttpDataSource createDataSource() {
@@ -230,7 +256,8 @@ public class DefaultHttpDataSource extends BaseDataSource implements HttpDataSou
               crossProtocolRedirectsForceOriginal,
               defaultRequestProperties,
               contentTypePredicate,
-              keepPostFor302Redirects);
+              keepPostFor302Redirects,
+              stripCredentialHeadersOnCrossOriginRedirects);
       if (transferListener != null) {
         dataSource.addTransferListener(transferListener);
       }
@@ -258,6 +285,7 @@ public class DefaultHttpDataSource extends BaseDataSource implements HttpDataSou
   private final RequestProperties requestProperties;
   @Nullable private final Predicate<String> contentTypePredicate;
   private final boolean keepPostFor302Redirects;
+  private final boolean stripCredentialHeadersOnCrossOriginRedirects;
 
   @Nullable private DataSpec dataSpec;
   @Nullable private HttpURLConnection connection;
@@ -275,7 +303,8 @@ public class DefaultHttpDataSource extends BaseDataSource implements HttpDataSou
       boolean crossProtocolRedirectsForceOriginal,
       @Nullable RequestProperties defaultRequestProperties,
       @Nullable Predicate<String> contentTypePredicate,
-      boolean keepPostFor302Redirects) {
+      boolean keepPostFor302Redirects,
+      boolean stripCredentialHeadersOnCrossOriginRedirects) {
     super(/* isNetwork= */ true);
     this.userAgent = userAgent;
     this.connectTimeoutMillis = connectTimeoutMillis;
@@ -291,6 +320,7 @@ public class DefaultHttpDataSource extends BaseDataSource implements HttpDataSou
     this.contentTypePredicate = contentTypePredicate;
     this.requestProperties = new RequestProperties();
     this.keepPostFor302Redirects = keepPostFor302Redirects;
+    this.stripCredentialHeadersOnCrossOriginRedirects = stripCredentialHeadersOnCrossOriginRedirects;
   }
 
   @UnstableApi
@@ -533,11 +563,17 @@ public class DefaultHttpDataSource extends BaseDataSource implements HttpDataSou
           length,
           allowGzip,
           /* followRedirects= */ true,
-          dataSpec.httpRequestHeaders);
+          dataSpec.httpRequestHeaders,
+          // Automatic following is performed by the platform, so there is no opportunity to strip
+          // credential headers here.
+          /* credentialStrippingOrigin= */ null);
     }
 
     // We need to handle redirects ourselves to allow cross-protocol redirects or to keep the POST
     // request method for 302.
+    @Nullable
+    URL credentialStrippingOrigin =
+        stripCredentialHeadersOnCrossOriginRedirects ? url : null;
     int redirectCount = 0;
     while (redirectCount++ <= MAX_REDIRECTS) {
       HttpURLConnection connection =
@@ -549,7 +585,8 @@ public class DefaultHttpDataSource extends BaseDataSource implements HttpDataSou
               length,
               allowGzip,
               /* followRedirects= */ false,
-              dataSpec.httpRequestHeaders);
+              dataSpec.httpRequestHeaders,
+              credentialStrippingOrigin);
       int responseCode = connection.getResponseCode();
       String location = connection.getHeaderField("Location");
       if ((httpMethod == DataSpec.HTTP_METHOD_GET || httpMethod == DataSpec.HTTP_METHOD_HEAD)
@@ -599,6 +636,9 @@ public class DefaultHttpDataSource extends BaseDataSource implements HttpDataSou
    * @param allowGzip Whether to allow the use of gzip.
    * @param followRedirects Whether to follow redirects.
    * @param requestParameters parameters (HTTP headers) to include in request.
+   * @param credentialStrippingOrigin If non-null and {@code url} has a different origin, credential
+   *     headers ({@code Cookie} and {@code Authorization}) are removed from the request headers.
+   *     Null disables stripping.
    */
   private HttpURLConnection makeConnection(
       URL url,
@@ -608,7 +648,8 @@ public class DefaultHttpDataSource extends BaseDataSource implements HttpDataSou
       long length,
       boolean allowGzip,
       boolean followRedirects,
-      Map<String, String> requestParameters)
+      Map<String, String> requestParameters,
+      @Nullable URL credentialStrippingOrigin)
       throws IOException {
     HttpURLConnection connection = openConnection(url);
     connection.setConnectTimeout(connectTimeoutMillis);
@@ -620,6 +661,9 @@ public class DefaultHttpDataSource extends BaseDataSource implements HttpDataSou
     }
     requestHeaders.putAll(requestProperties.getSnapshot());
     requestHeaders.putAll(requestParameters);
+    if (credentialStrippingOrigin != null && !isSameOrigin(url, credentialStrippingOrigin)) {
+      removeCredentialHeaders(requestHeaders);
+    }
 
     for (Map.Entry<String, String> property : requestHeaders.entrySet()) {
       connection.setRequestProperty(property.getKey(), property.getValue());
@@ -653,6 +697,39 @@ public class DefaultHttpDataSource extends BaseDataSource implements HttpDataSou
   @VisibleForTesting
   /* package */ HttpURLConnection openConnection(URL url) throws IOException {
     return (HttpURLConnection) url.openConnection();
+  }
+
+  /**
+   * Removes credential headers ({@code Cookie} and {@code Authorization}) from the given header
+   * map, so they are not forwarded when following a redirect to a different origin. Non-credential
+   * headers (including {@code User-Agent}, {@code Referer} and {@code Origin}) are kept, matching
+   * the behavior of mainstream HTTP clients, which only strip authentication material.
+   */
+  private static void removeCredentialHeaders(Map<String, String> requestHeaders) {
+    Iterator<Map.Entry<String, String>> iterator = requestHeaders.entrySet().iterator();
+    while (iterator.hasNext()) {
+      String name = iterator.next().getKey();
+      if (HttpHeaders.COOKIE.equalsIgnoreCase(name)
+          || HttpHeaders.AUTHORIZATION.equalsIgnoreCase(name)) {
+        iterator.remove();
+      }
+    }
+  }
+
+  /**
+   * Returns whether the two URLs have the same origin, comparing protocol, host (case-insensitive)
+   * and port, with default ports normalized (80 for HTTP, 443 for HTTPS).
+   */
+  private static boolean isSameOrigin(URL first, URL second) {
+    return first.getProtocol().equalsIgnoreCase(second.getProtocol())
+        && urlEffectivePort(first) == urlEffectivePort(second)
+        && first.getHost() != null
+        && first.getHost().equalsIgnoreCase(second.getHost());
+  }
+
+  private static int urlEffectivePort(URL url) {
+    int port = url.getPort();
+    return port != -1 ? port : url.getDefaultPort();
   }
 
   /**
